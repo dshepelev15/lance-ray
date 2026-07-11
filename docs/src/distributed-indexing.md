@@ -108,9 +108,17 @@ def create_index(
     num_partitions: Optional[int] = None,
     num_sub_vectors: Optional[int] = None,
     sample_rate: int = 256,
+    ivf_sample_rate: Optional[int] = None,
+    pq_sample_rate: Optional[int] = None,
+    max_iters: int = 50,
+    accelerator: Optional[Any] = None,
     ivf_centroids: Optional["pyarrow.Array"] = None,
     pq_codebook: Optional["pyarrow.Array"] = None,
     rabitq_model: Optional[str] = None,
+    rows_per_task: Optional[int] = None,
+    max_task_retries: int = 2,
+    checkpoint_dir: Optional[str] = None,
+    target_num_segments: Optional[int] = None,
     **kwargs: Any,
 ) -> "lance.LanceDataset":
 ```
@@ -135,10 +143,18 @@ def create_index(
 | `num_partitions` | `int`, optional | Number of IVF partitions |
 | `num_sub_vectors` | `int`, optional | Number of PQ sub-vectors |
 | `sample_rate` | `int`, optional | Number of rows sampled per IVF partition and PQ centroid, default is 256 |
-| `ivf_centroids` | `pyarrow.Array`, optional | Pre-computed IVF centroids (advanced) |
-| `pq_codebook` | `pyarrow.Array`, optional | Pre-computed PQ codebook for PQ-based indices (advanced) |
+| `ivf_sample_rate` | `int`, optional | Overrides `sample_rate` for IVF centroid training. The IVF training sample is `ivf_sample_rate * num_partitions` rows, so lowering it bounds driver memory on large partition counts |
+| `pq_sample_rate` | `int`, optional | Overrides `sample_rate` for PQ codebook training |
+| `max_iters` | `int`, optional | Maximum k-means iterations for IVF and PQ training, default is 50 |
+| `accelerator` | `str` or `torch.Device`, optional | Accelerator for driver-side IVF training, e.g. `"cuda"` or `"mps"`. Applies to Phase 1 training only; it is not forwarded to fragment workers because torch inputs disable Lance's distributed build path |
+| `ivf_centroids` | `pyarrow.Array`, optional | Pre-computed IVF centroids. When provided, driver-side IVF training is skipped and `num_partitions` is derived from the centroids |
+| `pq_codebook` | `pyarrow.Array`, optional | Pre-computed PQ codebook for PQ-based indices. When provided together with `num_sub_vectors`, driver-side PQ training is skipped. Must be trained against the same centroids and metric |
 | `rabitq_model` | `str`, optional | Pre-built RaBitQ model for IVF_RQ. If omitted for IVF_RQ, Lance-Ray builds one shared model on the driver |
 | `num_bits` | `int`, optional | RaBitQ bits per vector dimension for IVF_RQ, default is 1. Passed through to Lance for validation |
+| `rows_per_task` | `int`, optional | Target rows per fragment batch. Each batch is one Ray task and one uncommitted index segment; set well below `total_rows / num_workers` on large builds so a retry re-runs only a small batch and slow batches are amortized across the run instead of gating it. Batches never exceed Lance's hard limit of 2^32 rows per segment |
+| `max_task_retries` | `int`, optional | How many times failed fragment batches (and merge groups) are resubmitted before the build fails, default is 2 |
+| `checkpoint_dir` | `str`, optional | Driver-local directory persisting Phase 1 artifacts and completed segments. Re-running the same build with the same directory resumes instead of retraining/rebuilding; cleared after a successful commit |
+| `target_num_segments` | `int`, optional | Physically merge built segments on Ray workers down to this many segments before commit. Query cost grows with the number of committed segments, so large builds should merge |
 | `**kwargs` | `Any` | Additional arguments to pass through to Lance index creation |
 
 For `IVF_RQ`, Lance-Ray builds one shared RaBitQ rotation model on the driver
@@ -155,6 +171,65 @@ supported values are validated by Lance.
 #### Return Value
 
 The function returns an updated Lance dataset with the newly created vector index.
+
+#### Scaling to very large tables
+
+Each fragment batch becomes one Ray task and one uncommitted index segment,
+and `commit_existing_index_segments` is a metadata-only operation: without
+merging, a build with `N` batches commits `N` index segments and every query
+probes each segment separately. For large builds:
+
+1. **Bound driver-side training.** The IVF training sample is
+   `ivf_sample_rate * num_partitions` rows held on the driver. For hundreds of
+   thousands of partitions, lower `ivf_sample_rate` (64-128), cap `max_iters`,
+   and train on a GPU with `accelerator="cuda"`. Alternatively train centroids
+   externally (e.g. on a GPU box) and pass them as `ivf_centroids` — training
+   is then skipped entirely.
+2. **Use many small tasks.** Set `rows_per_task` so that each worker processes
+   many batches (e.g. 10-50x more batches than workers). Failed batches are
+   retried individually (`max_task_retries`), so a retry re-runs one small
+   batch instead of a worker's whole share, and uneven batch durations
+   average out across the run. For resilience to worker-process crashes (not
+   just in-task errors), also set `{"max_restarts": ...}` in
+   `ray_remote_args` so Ray restarts dead pool actors. Every batch is kept
+   below Lance's hard limit of 2^32 rows per segment.
+3. **Checkpoint long builds.** Pass `checkpoint_dir` so a driver crash or an
+   exhausted retry budget does not lose completed work: re-running the same
+   call resumes from the persisted Phase 1 artifacts and finished segments.
+4. **Merge segments before commit.** Set `target_num_segments` (e.g. 4-16) so
+   the many per-task segments are physically merged on Ray workers into a few
+   segments. Merging requires shared training artifacts, which Lance-Ray
+   guarantees by broadcasting one set of centroids/codebook/RaBitQ rotation to
+   all workers. Note that object stores commonly cap a single object at 5 TB,
+   which bounds how few segments a very large index can merge into.
+5. **Provision worker temp space.** Workers spill partition-sorted quantized
+   codes to the OS temp directory during the shuffle. Point `TMPDIR` at fast
+   local disk and size it for `code_bytes_per_row * rows_per_task`. Relevant
+   Lance environment variables include `LANCE_SHUFFLE_BATCH_BYTES` (shuffle
+   buffer, default 128 MiB), `LANCE_MAX_TEMP_DIRECTORY_SIZE`,
+   `LANCE_CPU_THREADS`, and `LANCE_IO_THREADS`.
+6. **Size workers explicitly.** Use `ray_remote_args` (e.g.
+   `{"num_cpus": 16, "memory": 64 * 2**30}`) so Ray schedules one worker per
+   16 vCPU / 64 GiB slice instead of packing all actors onto one node.
+
+```python
+# Example: large IVF_PQ build tuned for scale.
+ds = lr.create_index(
+    uri="s3://bucket/big_table.lance",
+    column="vector",
+    index_type="IVF_PQ",
+    num_partitions=262144,
+    num_sub_vectors=96,
+    ivf_sample_rate=64,
+    accelerator="cuda",          # GPU k-means on the driver
+    num_workers=512,
+    rows_per_task=200_000_000,   # many small tasks per worker
+    max_task_retries=2,
+    checkpoint_dir="/mnt/checkpoints/big_table_ivf_pq",
+    target_num_segments=16,      # merged on workers before commit
+    ray_remote_args={"num_cpus": 16, "memory": 64 * 2**30},
+)
+```
 
 ### Index Optimization (Incremental Updates)
 

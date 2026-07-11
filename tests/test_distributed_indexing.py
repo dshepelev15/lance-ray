@@ -1468,7 +1468,11 @@ class TestNamespaceIndexing:
 
 
 def generate_multi_fragment_vector_dataset(
-    tmp_path, num_fragments: int = 4, rows_per_fragment: int = 64, dim: int = 128
+    tmp_path,
+    num_fragments: int = 4,
+    rows_per_fragment: int = 64,
+    dim: int = 128,
+    value_type: pa.DataType | None = None,
 ) -> str:
     """Generate a Lance dataset with a vector column and multiple fragments.
 
@@ -1483,6 +1487,8 @@ def generate_multi_fragment_vector_dataset(
     # Manually construct a FixedSizeList "vector" column compatible with
     # Lance's vector index requirements.
     values = pa.array(data, type=pa.float32())
+    if value_type is not None and value_type != pa.float32():
+        values = values.cast(value_type)
     vector_array = pa.FixedSizeListArray.from_arrays(values, dim)
     tbl = pa.Table.from_arrays([vector_array], names=["vector"])
     tbl = tbl.append_column("id", pa.array(range(num_rows), type=pa.int64()))
@@ -1567,9 +1573,7 @@ def test_build_distributed_vector_index(tmp_path, index_type):
     assert len(indices) > 0, "No indices found after distributed vector index build"
 
     # Find the index with the name we specified
-    vec_index = next(
-        (idx for idx in indices if idx.name == f"idx_{index_type}"), None
-    )
+    vec_index = next((idx for idx in indices if idx.name == f"idx_{index_type}"), None)
     assert vec_index is not None, f"Index with name idx_{index_type} not found"
     assert vec_index.index_type == index_type, (
         f"Expected {index_type} vector index, got {vec_index.index_type}"
@@ -1646,3 +1650,172 @@ def test_distributed_nested_vector_index_and_search(tmp_path, index_type):
 
     assert result.num_rows == 5
     assert result.column("id").to_pylist()[0] == 0
+
+
+def _skip_if_vector_segments_unsupported(exc: RuntimeError):
+    msg = str(exc)
+    if "Creating empty vector indices with train=False is not yet implemented" in msg:
+        pytest.skip(
+            "Current pylance build does not yet support distributed vector "
+            "indices with train=False; skipping functional test."
+        )
+    raise exc
+
+
+def test_build_distributed_vector_index_ivf_rq(tmp_path):
+    """IVF_RQ should build end-to-end with a shared RaBitQ rotation."""
+    dataset_uri = generate_multi_fragment_vector_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=512, dim=128
+    )
+
+    try:
+        updated_dataset = lr.create_index(
+            uri=dataset_uri,
+            column="vector",
+            index_type="IVF_RQ",
+            name="idx_ivf_rq",
+            num_workers=2,
+            num_partitions=4,
+            sample_rate=8,
+        )
+    except RuntimeError as exc:
+        _skip_if_vector_segments_unsupported(exc)
+
+    indices = {idx.name: idx for idx in updated_dataset.describe_indices()}
+    assert indices["idx_ivf_rq"].index_type == "IVF_RQ"
+
+    q = [random.gauss(0, 1) for _ in range(128)]
+    result = updated_dataset.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert result.num_rows == 5
+
+
+def test_build_distributed_vector_index_float16_dim768(tmp_path):
+    """float16 vectors at dim=768 (the common embedding shape) should index."""
+    dataset_uri = generate_multi_fragment_vector_dataset(
+        tmp_path,
+        num_fragments=4,
+        rows_per_fragment=512,
+        dim=768,
+        value_type=pa.float16(),
+    )
+
+    try:
+        updated_dataset = lr.create_index(
+            uri=dataset_uri,
+            column="vector",
+            index_type="IVF_PQ",
+            name="idx_fp16",
+            num_workers=2,
+            num_partitions=4,
+            num_sub_vectors=48,
+            sample_rate=8,
+        )
+    except RuntimeError as exc:
+        _skip_if_vector_segments_unsupported(exc)
+
+    indices = {idx.name: idx for idx in updated_dataset.describe_indices()}
+    assert indices["idx_fp16"].index_type == "IVF_PQ"
+
+    q = [random.gauss(0, 1) for _ in range(768)]
+    result = updated_dataset.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert result.num_rows == 5
+
+
+def test_build_distributed_vector_index_merges_to_target_num_segments(tmp_path):
+    """rows_per_task + target_num_segments should commit fewer, merged segments."""
+    dataset_uri = generate_multi_fragment_vector_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=512, dim=64
+    )
+
+    try:
+        updated_dataset = lr.create_index(
+            uri=dataset_uri,
+            column="vector",
+            index_type="IVF_PQ",
+            name="idx_merged",
+            num_workers=2,
+            num_partitions=4,
+            num_sub_vectors=8,
+            sample_rate=8,
+            # Four fragment batches (one per fragment), merged down to one
+            # physical segment before commit.
+            rows_per_task=512,
+            target_num_segments=1,
+        )
+    except RuntimeError as exc:
+        _skip_if_vector_segments_unsupported(exc)
+
+    q = [random.gauss(0, 1) for _ in range(64)]
+    result = updated_dataset.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert result.num_rows == 5
+
+    plan = updated_dataset.scanner(
+        nearest={"column": "vector", "q": q, "k": 5},
+        columns=["id"],
+    ).explain_plan()
+    assert "ANNSubIndex" in plan
+    assert "deltas=1" in plan
+
+
+def test_build_distributed_vector_index_with_checkpoint_dir(tmp_path):
+    """A successful build should leave the checkpoint directory empty."""
+    dataset_uri = generate_multi_fragment_vector_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=256, dim=64
+    )
+    checkpoint_dir = Path(tmp_path) / "index_checkpoint"
+
+    try:
+        updated_dataset = lr.create_index(
+            uri=dataset_uri,
+            column="vector",
+            index_type="IVF_FLAT",
+            name="idx_ckpt",
+            num_workers=2,
+            num_partitions=4,
+            sample_rate=8,
+            checkpoint_dir=str(checkpoint_dir),
+        )
+    except RuntimeError as exc:
+        _skip_if_vector_segments_unsupported(exc)
+
+    q = [random.gauss(0, 1) for _ in range(64)]
+    result = updated_dataset.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert result.num_rows == 5
+
+    # The per-build checkpoint is removed after a successful commit.
+    assert not any(checkpoint_dir.iterdir())
+
+
+def test_build_distributed_vector_index_with_precomputed_centroids(tmp_path):
+    """Externally trained IVF centroids should be honored, not retrained."""
+    from lance.indices import IndicesBuilder
+
+    dataset_uri = generate_multi_fragment_vector_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=512, dim=64
+    )
+
+    raw_dataset = lance.dataset(dataset_uri)
+    ivf_model = IndicesBuilder(raw_dataset, "vector").train_ivf(
+        num_partitions=4, sample_rate=8
+    )
+
+    try:
+        updated_dataset = lr.create_index(
+            uri=dataset_uri,
+            column="vector",
+            index_type="IVF_PQ",
+            name="idx_precomputed",
+            num_workers=2,
+            ivf_centroids=ivf_model.centroids,
+            num_sub_vectors=8,
+            sample_rate=8,
+        )
+    except RuntimeError as exc:
+        _skip_if_vector_segments_unsupported(exc)
+
+    indices = {idx.name: idx for idx in updated_dataset.describe_indices()}
+    assert indices["idx_precomputed"].index_type == "IVF_PQ"
+
+    q = [random.gauss(0, 1) for _ in range(64)]
+    result = updated_dataset.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert result.num_rows == 5
