@@ -1,10 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright The Lance Authors
 
+import hashlib
+import heapq
 import logging
 import math
+import os
+import pickle
+import shutil
+import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any, Literal, Optional, TypeAlias, Union
 
 import lance
@@ -134,34 +140,84 @@ def _distribute_fragments_balanced(
 
 def _map_async_with_pool(
     create_fragment_handler: Callable[[], Any],
-    fragment_batches: list[list[int]],
+    fragment_batches: list[Any],
     *,
     num_workers: int,
     ray_remote_args: Optional[dict[str, Any]],
     error_prefix: str,
+    max_task_retries: int = 0,
+    on_success: Optional[Callable[[Any, dict[str, Any]], None]] = None,
 ) -> list[dict[str, Any]]:
     """Run fragment tasks in a Ray-backed multiprocessing Pool.
 
-    This helper encapsulates the common Pool.map_async + get + error wrapping
-    logic so that both scalar and vector distributed index builders can share
-    the same implementation.
+    This helper encapsulates the common Pool submission + error wrapping logic
+    so that both scalar and vector distributed index builders can share the
+    same implementation.
+
+    When ``max_task_retries`` is positive, task payloads whose handler returned
+    a ``{"status": "error"}`` result — or whose task failed at the Ray level
+    (Ray's Pool yields the exception *object* as the imap value when a task or
+    its actor dies) — are resubmitted (handlers must therefore be idempotent).
+    Note that Ray Pool actors are not restarted after an actor death by
+    default; pass ``{"max_restarts": ...}`` in ``ray_remote_args`` to make
+    retries survive worker-process crashes. ``on_success`` is invoked with
+    ``(payload, result)`` as soon as a task result with
+    ``status == "success"`` is observed, which allows callers to checkpoint
+    completed work before the whole map finishes.
     """
     pool = Pool(processes=num_workers, ray_remote_args=ray_remote_args)
     try:
         fragment_handler = create_fragment_handler()
-        rst_futures = pool.map_async(
-            fragment_handler,
-            fragment_batches,
-            chunksize=1,
-        )
-        results = rst_futures.get()
+
+        if max_task_retries == 0 and on_success is None:
+            rst_futures = pool.map_async(
+                fragment_handler,
+                fragment_batches,
+                chunksize=1,
+            )
+            return rst_futures.get()
+
+        results: dict[int, dict[str, Any]] = {}
+        pending = list(enumerate(fragment_batches))
+        for attempt in range(max_task_retries + 1):
+            round_payloads = [payload for _, payload in pending]
+            still_failing: list[tuple[int, Any]] = []
+            for (payload_index, payload), result in zip(
+                pending,
+                pool.imap(fragment_handler, round_payloads, chunksize=1),
+                strict=True,
+            ):
+                if isinstance(result, Exception):
+                    # Ray's Pool delivers task/actor failures as exception
+                    # objects in the imap stream (PoolTaskError wraps the
+                    # original exception in .underlying).
+                    underlying = getattr(result, "underlying", result)
+                    result = {
+                        "status": "error",
+                        "error": f"{type(underlying).__name__}: {underlying}",
+                    }
+                results[payload_index] = result
+                if result.get("status") == "success":
+                    if on_success is not None:
+                        on_success(payload, result)
+                else:
+                    still_failing.append((payload_index, payload))
+            pending = still_failing
+            if not pending:
+                break
+            if attempt < max_task_retries:
+                logger.warning(
+                    "%d task(s) failed; retrying (attempt %d of %d)",
+                    len(pending),
+                    attempt + 2,
+                    max_task_retries + 1,
+                )
+        return [results[i] for i in range(len(fragment_batches))]
     except Exception as exc:  # pragma: no cover - exercised via integration tests
         raise RuntimeError(f"{error_prefix}: {exc}") from exc
     finally:
         pool.close()
         pool.join()
-
-    return results
 
 
 def _is_ray_object_ref(value: Any) -> bool:
@@ -771,6 +827,257 @@ _VECTOR_INDEX_TYPES = {
     "IVF_HNSW_SQ",
 }
 
+# Lance's IVF shuffler stores partition offsets in a spill file as 32-bit
+# values, so a single uncommitted index segment cannot cover 2^32 or more
+# rows. Fragment batches are capped below this limit.
+_MAX_ROWS_PER_SEGMENT = (1 << 32) - 1
+
+
+def _fragment_sizes(
+    fragments: list[Any], logger: logging.Logger
+) -> tuple[dict[int, int], list[int]]:
+    """Return a fragment_id -> row count map plus fragments of unknown size."""
+    sizes: dict[int, int] = {}
+    unknown: list[int] = []
+    for fragment in fragments:
+        try:
+            sizes[fragment.fragment_id] = fragment.count_rows()
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning(
+                "Could not get row count for fragment %s: %s. It will be "
+                "placed in its own batch.",
+                fragment.fragment_id,
+                exc,
+            )
+            unknown.append(fragment.fragment_id)
+    return sizes, unknown
+
+
+def _plan_fragment_batches(
+    fragments: list[Any],
+    *,
+    num_workers: int,
+    rows_per_task: Optional[int],
+    logger: logging.Logger,
+) -> tuple[list[list[int]], dict[int, int]]:
+    """Pack fragments into batches; each batch becomes one index segment.
+
+    Batches are balanced by row count with a greedy largest-first algorithm
+    over a min-heap (O(F log B)). ``rows_per_task`` sets a target batch size
+    so that large builds produce many more tasks than workers (per-task
+    retries stay cheap and stragglers are amortized); when omitted the
+    fragments are spread evenly over ``num_workers`` batches. Every batch is
+    additionally kept below Lance's hard per-segment limit of 2^32 rows;
+    fragments whose row count cannot be determined are isolated in singleton
+    batches (a single Lance fragment cannot exceed the per-segment limit).
+    """
+    sizes, unknown_size_fragments = _fragment_sizes(fragments, logger)
+    if not sizes and not unknown_size_fragments:
+        return [], {}
+
+    total_rows = sum(sizes.values())
+    if rows_per_task is not None:
+        target_rows = rows_per_task
+    elif total_rows > 0:
+        target_rows = math.ceil(total_rows / num_workers)
+    else:
+        target_rows = 1
+    target_rows = min(max(target_rows, 1), _MAX_ROWS_PER_SEGMENT)
+    num_batches = num_workers
+    if total_rows > 0:
+        num_batches = max(num_workers, math.ceil(total_rows / target_rows))
+
+    ordered = sorted(sizes.items(), key=lambda item: (-item[1], item[0]))
+    batches: list[list[int]] = [[] for _ in range(num_batches)]
+    # Min-heap of (workload, batch_index); ties resolve to the lowest index.
+    heap: list[tuple[int, int]] = [(0, i) for i in range(num_batches)]
+
+    for fragment_id, size in ordered:
+        if size > _MAX_ROWS_PER_SEGMENT:
+            raise ValueError(
+                f"Fragment {fragment_id} has {size} rows, which exceeds the "
+                f"maximum of {_MAX_ROWS_PER_SEGMENT} rows a single index "
+                "segment can cover. Split the fragment (e.g. via compaction) "
+                "before building a distributed vector index."
+            )
+        workload, batch_index = heap[0]
+        if workload + size > _MAX_ROWS_PER_SEGMENT:
+            # The least-loaded batch cannot fit this fragment, so no batch
+            # can: open a new one.
+            batches.append([])
+            batch_index = len(batches) - 1
+            heapq.heappush(heap, (size, batch_index))
+        else:
+            heapq.heapreplace(heap, (workload + size, batch_index))
+        batches[batch_index].append(fragment_id)
+
+    # Fragments whose size is unknown must not be packed with others, or the
+    # per-segment row cap could be silently exceeded.
+    for fragment_id in unknown_size_fragments:
+        batches.append([fragment_id])
+
+    non_empty = [batch for batch in batches if batch]
+    logger.info(
+        "Planned %d fragment batches over %d fragments (%d total rows, "
+        "target %d rows per batch)",
+        len(non_empty),
+        len(sizes) + len(unknown_size_fragments),
+        total_rows,
+        target_rows,
+    )
+    return non_empty, sizes
+
+
+class _VectorIndexBuildCheckpoint:
+    """Driver-local checkpoint store for distributed vector index builds.
+
+    Persists the Phase 1 training artifacts and every successfully built
+    (still uncommitted) index segment so that a failed build can be resumed
+    without retraining or rebuilding completed segments. Entries are keyed by
+    a fingerprint of the build configuration and dataset version; a checkpoint
+    written for a different configuration is ignored.
+    """
+
+    _PHASE1_FILE = "phase1.pkl"
+
+    def __init__(self, root: str, fingerprint: str):
+        self._fingerprint = fingerprint
+        self._dir = os.path.join(root, fingerprint[:16])
+        self._segments_dir = os.path.join(self._dir, "segments")
+        self._merges_dir = os.path.join(self._dir, "merges")
+        os.makedirs(self._segments_dir, exist_ok=True)
+        os.makedirs(self._merges_dir, exist_ok=True)
+
+    @staticmethod
+    def build_fingerprint(**parts: Any) -> str:
+        canonical = repr(sorted(parts.items()))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @staticmethod
+    def _task_key(parts: Iterable[Any]) -> str:
+        canonical = repr(tuple(sorted(str(part) for part in parts)))
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:32]
+
+    def _write(self, path: str, payload: Any) -> None:
+        # Checkpointing is a resume optimization, not required state: never
+        # fail the build because a checkpoint file could not be written.
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp_path = f"{path}.tmp-{uuid.uuid4().hex}"
+            with open(tmp_path, "wb") as fh:
+                pickle.dump({"fingerprint": self._fingerprint, "payload": payload}, fh)
+            os.replace(tmp_path, path)
+        except Exception as exc:  # pragma: no cover - environment dependent
+            logger.warning("Failed to write checkpoint file %s: %s", path, exc)
+
+    def _read(self, path: str) -> Optional[dict[str, Any]]:
+        if not os.path.exists(path):
+            return None
+        try:
+            with open(path, "rb") as fh:
+                data = pickle.load(fh)
+        except Exception as exc:  # pragma: no cover - corrupted checkpoint
+            logger.warning("Ignoring unreadable checkpoint file %s: %s", path, exc)
+            return None
+        if not isinstance(data, dict) or data.get("fingerprint") != self._fingerprint:
+            return None
+        return {"payload": data.get("payload")}
+
+    def load_phase1(self) -> Optional[dict[str, Any]]:
+        entry = self._read(os.path.join(self._dir, self._PHASE1_FILE))
+        return entry["payload"] if entry is not None else None
+
+    def save_phase1(self, payload: dict[str, Any]) -> None:
+        self._write(os.path.join(self._dir, self._PHASE1_FILE), payload)
+
+    def _segment_path(self, fragment_ids: Iterable[int]) -> str:
+        return os.path.join(self._segments_dir, f"{self._task_key(fragment_ids)}.pkl")
+
+    def load_segment(self, fragment_ids: Iterable[int]) -> Any:
+        entry = self._read(self._segment_path(fragment_ids))
+        return entry["payload"] if entry is not None else None
+
+    def save_segment(self, fragment_ids: Iterable[int], segment: Any) -> None:
+        self._write(self._segment_path(fragment_ids), segment)
+
+    def _merge_path(self, member_keys: Iterable[Any]) -> str:
+        return os.path.join(self._merges_dir, f"{self._task_key(member_keys)}.pkl")
+
+    def load_merge(self, member_keys: Iterable[Any]) -> Any:
+        entry = self._read(self._merge_path(member_keys))
+        return entry["payload"] if entry is not None else None
+
+    def save_merge(self, member_keys: Iterable[Any], segment: Any) -> None:
+        self._write(self._merge_path(member_keys), segment)
+
+    def clear(self) -> None:
+        shutil.rmtree(self._dir, ignore_errors=True)
+
+
+def _artifact_digest(artifact: Any) -> Optional[str]:
+    """Content digest of a precomputed training artifact for fingerprinting.
+
+    Distinguishes different centroids/codebooks/models supplied across resume
+    attempts so that a checkpoint written for one artifact is never reused
+    for another.
+    """
+    if artifact is None:
+        return None
+    try:
+        if isinstance(artifact, pa.ChunkedArray):
+            artifact = artifact.combine_chunks()
+        if isinstance(artifact, pa.Array):
+            digest = hashlib.sha256(
+                f"{artifact.type}:{len(artifact)}:{artifact.offset}".encode()
+            )
+            for buf in artifact.buffers():
+                if buf is not None:
+                    digest.update(buf)
+            return digest.hexdigest()
+        if isinstance(artifact, (str, bytes)):
+            data = artifact.encode() if isinstance(artifact, str) else artifact
+            return hashlib.sha256(data).hexdigest()
+        tobytes = getattr(artifact, "tobytes", None)
+        if callable(tobytes):  # numpy-like
+            data = tobytes()
+            if isinstance(data, bytes):
+                digest = hashlib.sha256(
+                    f"{getattr(artifact, 'dtype', '')}:{getattr(artifact, 'shape', '')}".encode()
+                )
+                digest.update(data)
+                return digest.hexdigest()
+        return hashlib.sha256(pickle.dumps(artifact)).hexdigest()
+    except Exception:  # pragma: no cover - defensive
+        return "unhashable"
+
+
+def _segment_files_exist(dataset_uri: str, segment: Any) -> bool:
+    """Best-effort probe that a checkpointed segment's files still exist.
+
+    Uncommitted segment directories under ``_indices/<uuid>/`` can be
+    reclaimed by ``cleanup_old_versions`` between a failed build and its
+    resume; committing metadata that points at reclaimed files would produce
+    a broken index. When the storage cannot be probed the checkpoint is
+    trusted.
+    """
+    segment_uuid = getattr(segment, "uuid", None)
+    if not segment_uuid:
+        return True
+    try:
+        if os.path.isdir(dataset_uri):
+            index_dir = os.path.join(dataset_uri, "_indices", str(segment_uuid))
+            return os.path.isdir(index_dir) and bool(os.listdir(index_dir))
+        from pyarrow import fs as pa_fs
+
+        filesystem, base_path = pa_fs.FileSystem.from_uri(dataset_uri)
+        index_dir = f"{base_path.rstrip('/')}/_indices/{segment_uuid}"
+        infos = filesystem.get_file_info(
+            pa_fs.FileSelector(index_dir, allow_not_found=True)
+        )
+        return len(infos) > 0
+    except Exception:  # pragma: no cover - environment dependent
+        return True
+
 
 def _vector_dimension(field: pa.Field) -> int:
     if pa.types.is_fixed_size_list(field.type):
@@ -986,12 +1293,103 @@ def _train_pq_for_field_path(
     *,
     num_subvectors: Optional[int],
     sample_rate: int,
+    max_iters: int = 50,
 ) -> Any:
     return builder.train_pq(
         ivf_model,
         num_subvectors=num_subvectors,
         sample_rate=sample_rate,
+        max_iters=max_iters,
     )
+
+
+def _coerce_ivf_centroids(ivf_centroids: Any, dimension: int) -> Any:
+    """Normalize precomputed IVF centroids to a FixedSizeListArray.
+
+    Accepts a FixedSizeListArray / 1-D FixedShapeTensorArray of width
+    ``dimension``, a flat numeric ``pa.Array`` whose length is a multiple of
+    ``dimension``, or a 2-D numpy array of shape ``(num_partitions,
+    dimension)``.
+    """
+    if isinstance(ivf_centroids, pa.FixedShapeTensorArray):
+        shape = ivf_centroids.type.shape
+        if len(shape) != 1 or shape[0] != dimension:
+            raise ValueError(
+                f"ivf_centroids tensor shape {shape} does not match the vector "
+                f"dimension {dimension}"
+            )
+        return ivf_centroids.storage
+
+    if isinstance(ivf_centroids, pa.ChunkedArray):
+        ivf_centroids = ivf_centroids.combine_chunks()
+
+    if isinstance(ivf_centroids, pa.Array):
+        if pa.types.is_fixed_size_list(ivf_centroids.type):
+            if ivf_centroids.type.list_size != dimension:
+                raise ValueError(
+                    f"ivf_centroids list size {ivf_centroids.type.list_size} "
+                    f"does not match the vector dimension {dimension}"
+                )
+            return ivf_centroids
+        if len(ivf_centroids) == 0 or len(ivf_centroids) % dimension != 0:
+            raise ValueError(
+                f"Flat ivf_centroids length {len(ivf_centroids)} is not a "
+                f"positive multiple of the vector dimension {dimension}"
+            )
+        return pa.FixedSizeListArray.from_arrays(ivf_centroids, dimension)
+
+    shape = getattr(ivf_centroids, "shape", None)
+    if shape is not None and len(shape) == 2:
+        if shape[1] != dimension:
+            raise ValueError(
+                f"ivf_centroids shape {tuple(shape)} does not match the "
+                f"vector dimension {dimension}"
+            )
+        values = pa.array(ivf_centroids.reshape(-1))
+        return pa.FixedSizeListArray.from_arrays(values, dimension)
+
+    raise TypeError(
+        "ivf_centroids must be a FixedSizeListArray, a 1-D "
+        "FixedShapeTensorArray, a flat pyarrow Array, or a 2-D numpy array; "
+        f"got {type(ivf_centroids)}"
+    )
+
+
+def _num_partitions_from_centroids(ivf_centroids: Any) -> int:
+    """Derive the IVF partition count from normalized centroids."""
+    num_partitions = len(ivf_centroids)
+    if num_partitions < 1:
+        raise ValueError("ivf_centroids must contain at least one centroid")
+    return num_partitions
+
+
+def _validate_pq_codebook(pq_codebook: Any, dimension: int) -> Any:
+    """Validate the shape of a precomputed PQ codebook where possible.
+
+    The PqModel layout is a FixedSizeListArray whose list size equals the
+    full vector dimension (one row per PQ code word). Shapes that cannot be
+    checked here are passed through to Lance, which performs its own
+    validation.
+    """
+    if isinstance(pq_codebook, pa.ChunkedArray):
+        pq_codebook = pq_codebook.combine_chunks()
+    if isinstance(pq_codebook, pa.Array) and pa.types.is_fixed_size_list(
+        pq_codebook.type
+    ):
+        if pq_codebook.type.list_size != dimension:
+            raise ValueError(
+                f"pq_codebook list size {pq_codebook.type.list_size} does not "
+                f"match the vector dimension {dimension}; expected the "
+                "PqModel layout with one full-dimension row per code word"
+            )
+        return pq_codebook
+    shape = getattr(pq_codebook, "shape", None)
+    if shape is not None and len(shape) == 2 and shape[1] != dimension:
+        raise ValueError(
+            f"pq_codebook shape {tuple(shape)} does not match the vector "
+            f"dimension {dimension}"
+        )
+    return pq_codebook
 
 
 def _normalize_index_type(index_type: Any) -> str:
@@ -1063,6 +1461,29 @@ def _validate_metric(metric: str) -> str:
     return metric_lower
 
 
+def _dataset_load_kwargs_with_manifest(
+    storage_options: Optional[dict[str, Any]],
+    namespace_kwargs: dict[str, Any],
+    block_size: Optional[int],
+    dataset_version: Optional[int],
+    serialized_manifest: Any,
+) -> dict[str, Any]:
+    """Build dataset load kwargs, reusing a broadcast manifest when available.
+
+    Passing the driver's serialized manifest (and pinning its version) lets
+    every worker skip re-reading the manifest from object storage and
+    guarantees the workers see the same fragment set the driver planned
+    against.
+    """
+    load_kwargs = _dataset_load_kwargs(storage_options, namespace_kwargs, block_size)
+    manifest = _ray_get_index_artifact(serialized_manifest)
+    if manifest is not None:
+        load_kwargs["serialized_manifest"] = manifest
+        if dataset_version is not None:
+            load_kwargs["version"] = dataset_version
+    return load_kwargs
+
+
 def _handle_vector_fragment_index(
     dataset_uri: str,
     column: str,
@@ -1080,6 +1501,8 @@ def _handle_vector_fragment_index(
     namespace_impl: Optional[str] = None,
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
+    dataset_version: Optional[int] = None,
+    serialized_manifest: Any = None,
     **kwargs: Any,
 ):
     """Create a fragment handler closure for vector index builds."""
@@ -1098,7 +1521,13 @@ def _handle_vector_fragment_index(
             )
             dataset = LanceDataset(
                 dataset_uri,
-                **_dataset_load_kwargs(storage_options, namespace_kwargs, block_size),
+                **_dataset_load_kwargs_with_manifest(
+                    storage_options,
+                    namespace_kwargs,
+                    block_size,
+                    dataset_version,
+                    serialized_manifest,
+                ),
             )
             available_fragments = {f.fragment_id for f in dataset.get_fragments()}
             invalid_fragments = set(fragment_ids) - available_fragments
@@ -1157,6 +1586,156 @@ def _handle_vector_fragment_index(
     return func
 
 
+def _handle_merge_segments(
+    dataset_uri: str,
+    storage_options: Optional[dict[str, str]] = None,
+    block_size: Optional[int] = None,
+    namespace_impl: Optional[str] = None,
+    namespace_properties: Optional[dict[str, str]] = None,
+    table_id: Optional[list[str]] = None,
+    dataset_version: Optional[int] = None,
+    serialized_manifest: Any = None,
+):
+    """Create a handler that physically merges one group of index segments.
+
+    Segments built with shared IVF/PQ/RaBitQ artifacts can be merged into a
+    single physical segment before commit; running the merges on Ray workers
+    parallelizes what would otherwise be a single-node post-processing step.
+    """
+
+    def func(segment_group: list[Any]) -> dict[str, Any]:
+        try:
+            segments = list(segment_group)
+            if not segments:
+                raise ValueError("segment group cannot be empty")
+
+            namespace_kwargs = get_namespace_kwargs(
+                namespace_impl, namespace_properties, table_id
+            )
+            dataset = LanceDataset(
+                dataset_uri,
+                **_dataset_load_kwargs_with_manifest(
+                    storage_options,
+                    namespace_kwargs,
+                    block_size,
+                    dataset_version,
+                    serialized_manifest,
+                ),
+            )
+
+            merged = dataset.merge_existing_index_segments(segments)
+            logger.info(
+                "Merged %d index segments into segment %s",
+                len(segments),
+                getattr(merged, "uuid", "<unknown>"),
+            )
+            return {"status": "success", "segment_index": merged}
+
+        except Exception as exc:  # pragma: no cover - exercised via integration tests
+            logger.error(
+                "Index segment merge task failed for %d segments: %s",
+                len(segment_group),
+                exc,
+            )
+            return {"status": "error", "error": str(exc)}
+
+    return func
+
+
+def _plan_segment_merge_groups(
+    results: list[dict[str, Any]],
+    fragment_sizes: dict[int, int],
+    target_num_segments: int,
+) -> list[list[Any]]:
+    """Greedily balance built segments into ``target_num_segments`` groups."""
+    entries = []
+    for result in results:
+        segment = result["segment_index"]
+        rows = sum(
+            fragment_sizes.get(fragment_id, 0)
+            for fragment_id in result.get("fragment_ids", [])
+        )
+        entries.append((rows, str(getattr(segment, "uuid", "")), segment))
+    entries.sort(key=lambda entry: (-entry[0], entry[1]))
+
+    groups: list[list[Any]] = [[] for _ in range(target_num_segments)]
+    workloads = [0] * target_num_segments
+    for rows, _, segment in entries:
+        group_index = min(range(target_num_segments), key=lambda i: workloads[i])
+        groups[group_index].append(segment)
+        workloads[group_index] += rows
+    return [group for group in groups if group]
+
+
+_INDEX_COMMIT_MAX_ATTEMPTS = 3
+_INDEX_COMMIT_RETRY_DELAY_S = 1.0
+
+
+class _IndexCommitCoverageError(RuntimeError):
+    """The dataset changed between segment build and commit; not retryable."""
+
+
+def _commit_index_segments_with_retry(
+    load_dataset: Callable[[], Any],
+    *,
+    index_name: str,
+    column: str,
+    segments: list[Any],
+    covered_fragment_ids: Optional[set[int]] = None,
+    built_version: Optional[int] = None,
+) -> Any:
+    """Commit index segments, retrying transient failures with backoff.
+
+    The dataset handle is reloaded before every attempt so that a retry
+    commits against the latest version (e.g. after a concurrent-writer
+    conflict). When ``covered_fragment_ids`` is given, each attempt first
+    verifies that every fragment the segments were built against still exists
+    in the commit-target version — segments are built against a pinned
+    dataset version, and committing them after those fragments were deleted
+    or compacted away would publish an index over vanished data.
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(_INDEX_COMMIT_MAX_ATTEMPTS):
+        try:
+            dataset = load_dataset()
+            if covered_fragment_ids is not None:
+                current_fragment_ids = {
+                    fragment.fragment_id for fragment in dataset.get_fragments()
+                }
+                missing = covered_fragment_ids - current_fragment_ids
+                if missing:
+                    raise _IndexCommitCoverageError(
+                        f"Dataset changed between index build (version "
+                        f"{built_version}) and commit (version "
+                        f"{getattr(dataset, 'version', 'unknown')}): fragments "
+                        f"{sorted(missing)[:10]} no longer exist. Rebuild the "
+                        "index against the current dataset version."
+                    )
+            return dataset.commit_existing_index_segments(
+                index_name=index_name,
+                column=column,
+                segments=segments,
+            )
+        except _IndexCommitCoverageError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt < _INDEX_COMMIT_MAX_ATTEMPTS - 1:
+                delay = _INDEX_COMMIT_RETRY_DELAY_S * (2**attempt)
+                logger.warning(
+                    "commit_existing_index_segments failed (attempt %d of %d): "
+                    "%s; retrying in %.1fs",
+                    attempt + 1,
+                    _INDEX_COMMIT_MAX_ATTEMPTS,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+    if last_exc is None:  # pragma: no cover - loop always sets last_exc
+        raise RuntimeError("commit_existing_index_segments failed")
+    raise last_exc
+
+
 def create_index(
     uri: Optional[Union[str, "lance.LanceDataset"]] = None,
     column: str = "",
@@ -1175,6 +1754,10 @@ def create_index(
     num_partitions: Optional[int] = None,
     num_sub_vectors: Optional[int] = None,
     sample_rate: int = 256,
+    ivf_sample_rate: Optional[int] = None,
+    pq_sample_rate: Optional[int] = None,
+    max_iters: int = 50,
+    accelerator: Optional[Any] = None,
     ivf_centroids: Optional[
         pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray
     ] = None,
@@ -1182,6 +1765,10 @@ def create_index(
         pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray
     ] = None,
     rabitq_model: Optional[str] = None,
+    rows_per_task: Optional[int] = None,
+    max_task_retries: int = 2,
+    checkpoint_dir: Optional[str] = None,
+    target_num_segments: Optional[int] = None,
     **kwargs: Any,
 ) -> "lance.LanceDataset":
     """Build distributed vector indices with Ray.
@@ -1202,15 +1789,54 @@ def create_index(
         ray_remote_args: Options for Ray tasks (keyword-only)
         metric: Distance metric to use (default: "l2")
         num_partitions: Number of IVF partitions (optional)
-        num_sub_vectors: Number of PQ sub-vectors (optional)
-        sample_rate: Number of rows sampled per IVF partition and PQ centroid (default: 256)
-        ivf_centroids: Pre-computed IVF centroids (optional)
-        pq_codebook: Pre-computed PQ codebook (optional)
+        num_sub_vectors: Number of PQ sub-vectors (optional). Required when a
+            precomputed ``pq_codebook`` is supplied.
+        sample_rate: Number of rows sampled per IVF partition and PQ centroid
+            (default: 256)
+        ivf_sample_rate: Overrides ``sample_rate`` for IVF centroid training.
+            The IVF training sample is ``ivf_sample_rate * num_partitions``
+            rows, so lowering this bounds driver memory on large partition
+            counts (optional)
+        pq_sample_rate: Overrides ``sample_rate`` for PQ codebook training
+            (optional)
+        max_iters: Maximum k-means iterations for IVF and PQ training
+            (default: 50)
+        accelerator: Accelerator for driver-side IVF centroid training, e.g.
+            ``"cuda"`` or ``"mps"`` (optional). Applies to Phase 1 training
+            only; it is intentionally not forwarded to fragment workers
+            because torch inputs disable Lance's distributed build path.
+        ivf_centroids: Pre-computed IVF centroids. When provided, driver-side
+            IVF training is skipped and ``num_partitions`` is derived from the
+            centroids. Accepts a FixedSizeListArray, a 1-D
+            FixedShapeTensorArray, a flat pyarrow Array, or a 2-D numpy array.
+        pq_codebook: Pre-computed PQ codebook. When provided together with
+            ``num_sub_vectors``, driver-side PQ training is skipped. The
+            codebook must have been trained against the same IVF centroids
+            and metric used for this build.
         rabitq_model: Pre-built RaBitQ model for IVF_RQ. If omitted, Lance-Ray
             builds one shared model on the driver and sends it to every worker.
             The model dimension is the vector column width and must be divisible
             by 8. The ``num_bits`` keyword controls RaBitQ bits per vector
             dimension and defaults to 1.
+        rows_per_task: Target number of rows per fragment batch. Each batch
+            becomes one Ray task and one uncommitted index segment; setting
+            this well below ``total_rows / num_workers`` yields many small
+            tasks, which improves retry granularity and straggler behavior on
+            large builds. Batches are always capped below Lance's hard limit
+            of 2^32 rows per segment (optional)
+        max_task_retries: How many times failed fragment batches (and merge
+            groups) are resubmitted before the build fails (default: 2)
+        checkpoint_dir: Driver-local directory used to persist Phase 1
+            training artifacts and completed segments. Re-running the same
+            build with the same checkpoint_dir resumes from the checkpoint
+            instead of retraining/rebuilding; the checkpoint is removed after
+            a successful commit (optional)
+        target_num_segments: When set and fewer than the number of built
+            segments, segments are physically merged on Ray workers into this
+            many segments before commit. Fewer committed segments make
+            queries cheaper (query cost grows with the number of index
+            segments), at the price of a merge pass over the quantized codes
+            (optional)
         **kwargs: Additional arguments to pass to the fragment index build entrypoint.
 
     Returns:
@@ -1227,6 +1853,36 @@ def create_index(
 
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+
+    for rate_name, rate_value in (
+        ("ivf_sample_rate", ivf_sample_rate),
+        ("pq_sample_rate", pq_sample_rate),
+    ):
+        if rate_value is not None and rate_value <= 0:
+            raise ValueError(f"{rate_name} must be positive, got {rate_value}")
+
+    if max_iters <= 0:
+        raise ValueError(f"max_iters must be positive, got {max_iters}")
+
+    if rows_per_task is not None and rows_per_task <= 0:
+        raise ValueError(f"rows_per_task must be positive, got {rows_per_task}")
+
+    if max_task_retries < 0:
+        raise ValueError(
+            f"max_task_retries must be non-negative, got {max_task_retries}"
+        )
+
+    if target_num_segments is not None and target_num_segments < 1:
+        raise ValueError(
+            f"target_num_segments must be at least 1, got {target_num_segments}"
+        )
+
+    if pq_codebook is not None and ivf_centroids is None:
+        raise ValueError(
+            "ivf_centroids must be provided when pq_codebook is provided; a "
+            "PQ codebook is only valid for the IVF centroids it was trained "
+            "against"
+        )
 
     if block_size is not None and block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
@@ -1284,8 +1940,7 @@ def create_index(
 
     if not replace and _index_exists(dataset_obj, name):
         raise ValueError(
-            f"Index with name '{name}' already exists. Set replace=True "
-            "to replace it."
+            f"Index with name '{name}' already exists. Set replace=True to replace it."
         )
 
     fragments = dataset_obj.get_fragments()
@@ -1298,8 +1953,6 @@ def create_index(
         num_workers = len(fragment_ids_to_use)
         logger.info("Adjusted num_workers to %d to match fragment count", num_workers)
 
-    ivf_centroids_artifact = ivf_centroids
-    pq_codebook_artifact = pq_codebook
     index_build_kwargs = dict(kwargs)
     if rabitq_model is not None:
         index_build_kwargs["rabitq_model"] = rabitq_model
@@ -1308,67 +1961,165 @@ def create_index(
     needs_pq = index_type_name in pq_index_types
     needs_rq = index_type_name == "IVF_RQ"
 
-    # Always perform global IVF training up front so that all shards share the
-    # same centroids and number of partitions. The Ray entrypoint owns the
-    # lifecycle of these artifacts and distributes them to workers.
-    logger.info(
-        "Phase 1: Training IVF centroids (index_type=%s, metric=%s)",
-        index_type_name,
-        metric_lower,
+    effective_ivf_sample_rate = (
+        ivf_sample_rate if ivf_sample_rate is not None else sample_rate
     )
+    effective_pq_sample_rate = (
+        pq_sample_rate if pq_sample_rate is not None else sample_rate
+    )
+
     builder = _indices_builder_for_field_path(dataset_obj, column, field)
     num_rows = dataset_obj.count_rows()
     dimension = builder.dimension
+    dataset_version = getattr(dataset_obj, "version", None)
 
-    requested_num_partitions = num_partitions
-    logger.info(
-        "Training IVF with requested_num_partitions=%s, num_rows=%d, "
-        "dimension=%d, sample_rate=%d",
-        requested_num_partitions,
-        num_rows,
-        dimension,
-        sample_rate,
-    )
-    ivf_model = builder.train_ivf(
-        num_partitions=requested_num_partitions,
-        distance_type=metric_lower,
-        sample_rate=sample_rate,
-    )
-    ivf_centroids_artifact = ivf_model.centroids
-    num_partitions = ivf_model.num_partitions
-    logger.info(
-        "IVF training completed: num_partitions=%d",
-        num_partitions,
-    )
+    if ivf_centroids is not None:
+        ivf_centroids = _coerce_ivf_centroids(ivf_centroids, dimension)
+    if pq_codebook is not None:
+        pq_codebook = _validate_pq_codebook(pq_codebook, dimension)
 
-    if needs_pq:
-        requested_num_sub_vectors = num_sub_vectors
+    checkpoint: Optional[_VectorIndexBuildCheckpoint] = None
+    if checkpoint_dir is not None:
+        fingerprint = _VectorIndexBuildCheckpoint.build_fingerprint(
+            dataset_uri=dataset_uri,
+            dataset_version=dataset_version,
+            column=column,
+            index_type=index_type_name,
+            name=name,
+            metric=metric_lower,
+            num_partitions=num_partitions,
+            num_sub_vectors=num_sub_vectors,
+            ivf_sample_rate=effective_ivf_sample_rate,
+            pq_sample_rate=effective_pq_sample_rate,
+            max_iters=max_iters,
+            extra_kwargs=repr(sorted((k, repr(v)) for k, v in kwargs.items())),
+            ivf_centroids_digest=_artifact_digest(ivf_centroids),
+            pq_codebook_digest=_artifact_digest(pq_codebook),
+            rabitq_model_digest=_artifact_digest(rabitq_model),
+        )
+        checkpoint = _VectorIndexBuildCheckpoint(checkpoint_dir, fingerprint)
+
+    # Global training artifacts are resolved once on the driver so that all
+    # shards share the same centroids/codebook/rotation; the Ray entrypoint
+    # owns the lifecycle of these artifacts and distributes them to workers.
+    ivf_centroids_artifact = ivf_centroids
+    pq_codebook_artifact = pq_codebook
+    ivf_model: Any = None
+
+    phase1_state = checkpoint.load_phase1() if checkpoint is not None else None
+    if phase1_state is not None:
         logger.info(
-            "Training PQ codebook: requested_num_sub_vectors=%s, sample_rate=%d",
-            requested_num_sub_vectors,
-            sample_rate,
+            "Phase 1: Reusing IVF/PQ training artifacts from checkpoint at %s",
+            checkpoint_dir,
         )
-        pq_model = _train_pq_for_field_path(
-            builder,
-            ivf_model,
-            num_subvectors=requested_num_sub_vectors,
-            sample_rate=sample_rate,
-        )
-        pq_codebook_artifact = pq_model.codebook
-        num_sub_vectors = pq_model.num_subvectors
-        logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
+        ivf_centroids_artifact = phase1_state["ivf_centroids"]
+        pq_codebook_artifact = phase1_state["pq_codebook"]
+        num_partitions = phase1_state["num_partitions"]
+        num_sub_vectors = phase1_state["num_sub_vectors"]
+        if (
+            phase1_state.get("rabitq_model") is not None
+            and index_build_kwargs.get("rabitq_model") is None
+        ):
+            index_build_kwargs["rabitq_model"] = phase1_state["rabitq_model"]
+    else:
+        if ivf_centroids_artifact is not None:
+            num_partitions = _num_partitions_from_centroids(ivf_centroids_artifact)
+            logger.info(
+                "Phase 1: Using precomputed IVF centroids "
+                "(num_partitions=%d); skipping IVF training",
+                num_partitions,
+            )
+        else:
+            requested_num_partitions = num_partitions
+            logger.info(
+                "Phase 1: Training IVF centroids (index_type=%s, metric=%s, "
+                "requested_num_partitions=%s, num_rows=%d, dimension=%d, "
+                "sample_rate=%d, max_iters=%d, accelerator=%s)",
+                index_type_name,
+                metric_lower,
+                requested_num_partitions,
+                num_rows,
+                dimension,
+                effective_ivf_sample_rate,
+                max_iters,
+                accelerator,
+            )
+            train_ivf_kwargs: dict[str, Any] = {
+                "num_partitions": requested_num_partitions,
+                "distance_type": metric_lower,
+                "sample_rate": effective_ivf_sample_rate,
+                "max_iters": max_iters,
+            }
+            if accelerator is not None:
+                train_ivf_kwargs["accelerator"] = accelerator
+            ivf_model = builder.train_ivf(**train_ivf_kwargs)
+            ivf_centroids_artifact = ivf_model.centroids
+            num_partitions = ivf_model.num_partitions
+            logger.info(
+                "IVF training completed: num_partitions=%d",
+                num_partitions,
+            )
 
-    if needs_rq and index_build_kwargs.get("rabitq_model") is None:
-        num_bits = index_build_kwargs.get("num_bits", 1)
-        logger.info(
-            "Building shared RaBitQ model: dimension=%d, num_bits=%s",
-            dimension,
-            num_bits,
-        )
-        index_build_kwargs["rabitq_model"] = _build_rabitq_model(
-            dimension=dimension,
-            num_bits=num_bits,
-        )
+        if needs_pq:
+            if pq_codebook_artifact is not None:
+                if num_sub_vectors is None:
+                    raise ValueError(
+                        "num_sub_vectors must be provided together with a "
+                        "precomputed pq_codebook"
+                    )
+                num_sub_vectors = _normalize_pq_params(num_sub_vectors, dimension)
+                logger.info(
+                    "Phase 1: Using precomputed PQ codebook "
+                    "(num_sub_vectors=%d); skipping PQ training",
+                    num_sub_vectors,
+                )
+            else:
+                if ivf_model is None:
+                    from lance.indices.ivf import IvfModel
+
+                    ivf_model = IvfModel(ivf_centroids_artifact, metric_lower)
+                requested_num_sub_vectors = num_sub_vectors
+                logger.info(
+                    "Training PQ codebook: requested_num_sub_vectors=%s, "
+                    "sample_rate=%d",
+                    requested_num_sub_vectors,
+                    effective_pq_sample_rate,
+                )
+                pq_model = _train_pq_for_field_path(
+                    builder,
+                    ivf_model,
+                    num_subvectors=requested_num_sub_vectors,
+                    sample_rate=effective_pq_sample_rate,
+                    max_iters=max_iters,
+                )
+                pq_codebook_artifact = pq_model.codebook
+                num_sub_vectors = pq_model.num_subvectors
+                logger.info(
+                    "PQ training completed: num_sub_vectors=%d", num_sub_vectors
+                )
+
+        if needs_rq and index_build_kwargs.get("rabitq_model") is None:
+            num_bits = index_build_kwargs.get("num_bits", 1)
+            logger.info(
+                "Building shared RaBitQ model: dimension=%d, num_bits=%s",
+                dimension,
+                num_bits,
+            )
+            index_build_kwargs["rabitq_model"] = _build_rabitq_model(
+                dimension=dimension,
+                num_bits=num_bits,
+            )
+
+        if checkpoint is not None:
+            checkpoint.save_phase1(
+                {
+                    "ivf_centroids": ivf_centroids_artifact,
+                    "pq_codebook": pq_codebook_artifact,
+                    "num_partitions": num_partitions,
+                    "num_sub_vectors": num_sub_vectors,
+                    "rabitq_model": index_build_kwargs.get("rabitq_model"),
+                }
+            )
 
     if ivf_centroids_artifact is None:
         raise ValueError(
@@ -1382,13 +2133,66 @@ def create_index(
             "distributed vector indices"
         )
 
-    fragment_batches = _distribute_fragments_balanced(
-        fragments, num_workers=num_workers, logger=logger
+    fragment_batches, fragment_sizes = _plan_fragment_batches(
+        fragments,
+        num_workers=num_workers,
+        rows_per_task=rows_per_task,
+        logger=logger,
     )
 
+    # Broadcast the driver's manifest so workers skip re-reading it from
+    # object storage and build against the exact version the batches were
+    # planned on. Namespace-managed tables keep the standard load path.
+    serialized_manifest: Optional[bytes] = None
+    if not namespace_kwargs:
+        manifest_fn = getattr(
+            getattr(dataset_obj, "_ds", None), "serialized_manifest", None
+        )
+        if manifest_fn is not None:
+            try:
+                serialized_manifest = manifest_fn()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Could not serialize dataset manifest for workers: %s", exc
+                )
+
+    cached_results: list[dict[str, Any]] = []
+    batches_to_build: list[list[int]] = []
+    for batch in fragment_batches:
+        segment = checkpoint.load_segment(batch) if checkpoint is not None else None
+        if segment is not None and not _segment_files_exist(dataset_uri, segment):
+            logger.warning(
+                "Checkpointed segment %s for fragments %s no longer exists "
+                "in storage; rebuilding the batch.",
+                getattr(segment, "uuid", "<unknown>"),
+                batch,
+            )
+            segment = None
+        if segment is not None:
+            cached_results.append(
+                {
+                    "status": "success",
+                    "fragment_ids": list(batch),
+                    "segment_index": segment,
+                    "uuid": getattr(segment, "uuid", None),
+                }
+            )
+        else:
+            batches_to_build.append(batch)
+
+    if cached_results:
+        logger.info(
+            "Phase 2: Reusing %d of %d segments from checkpoint at %s",
+            len(cached_results),
+            len(fragment_batches),
+            checkpoint_dir,
+        )
+
     logger.info(
-        "Phase 2: Distributing vector index build across %d workers for %d fragments",
-        len(fragment_batches),
+        "Phase 2: Distributing vector index build across %d workers for "
+        "%d fragment batches (%d fragments)",
+        num_workers,
+        len(batches_to_build),
         len(fragment_ids_to_use),
     )
 
@@ -1399,6 +2203,7 @@ def create_index(
                 pq_codebook_artifact,
             )
         )
+        shared_manifest = _ray_put_index_artifact(serialized_manifest)
         return _handle_vector_fragment_index(
             dataset_uri=dataset_uri,
             column=column,
@@ -1416,51 +2221,194 @@ def create_index(
             namespace_impl=namespace_impl,
             namespace_properties=namespace_properties,
             table_id=table_id,
+            dataset_version=dataset_version,
+            serialized_manifest=shared_manifest,
             **index_build_kwargs,
         )
 
-    results = _map_async_with_pool(
-        create_fragment_handler=create_fragment_handler,
-        fragment_batches=fragment_batches,
-        num_workers=num_workers,
-        ray_remote_args=ray_remote_args,
-        error_prefix="Failed to complete distributed vector index building",
-    )
+    on_segment_built: Optional[Callable[[list[int], dict[str, Any]], None]] = None
+    if checkpoint is not None:
+        segment_checkpoint = checkpoint
+
+        def _save_segment_on_success(batch: list[int], result: dict[str, Any]) -> None:
+            segment_checkpoint.save_segment(batch, result["segment_index"])
+
+        on_segment_built = _save_segment_on_success
+
+    if batches_to_build:
+        built_results = _map_async_with_pool(
+            create_fragment_handler=create_fragment_handler,
+            fragment_batches=batches_to_build,
+            num_workers=min(num_workers, len(batches_to_build)),
+            ray_remote_args=ray_remote_args,
+            error_prefix="Failed to complete distributed vector index building",
+            max_task_retries=max_task_retries,
+            on_success=on_segment_built,
+        )
+    else:
+        built_results = []
+
+    results = cached_results + built_results
 
     failed_results = [r for r in results if r.get("status") == "error"]
     if failed_results:
         error_messages = [r["error"] for r in failed_results if "error" in r]
+        completed_uuids = [
+            str(r.get("uuid") or getattr(r.get("segment_index"), "uuid", None))
+            for r in results
+            if r.get("status") == "success"
+        ]
+        if checkpoint is not None:
+            logger.error(
+                "Vector index build failed after %d retries; %d completed "
+                "segments are checkpointed at %s — re-run the same "
+                "create_index call to resume.",
+                max_task_retries,
+                len(completed_uuids),
+                checkpoint_dir,
+            )
+        elif completed_uuids:
+            logger.error(
+                "Vector index build failed; %d already-built uncommitted "
+                "segments are orphaned under _indices/ (uuids: %s) and will "
+                "be reclaimed by cleanup_old_versions. Pass checkpoint_dir "
+                "to make failed builds resumable.",
+                len(completed_uuids),
+                ", ".join(completed_uuids),
+            )
         raise RuntimeError("Vector index building failed: " + "; ".join(error_messages))
-
-    dataset_obj = LanceDataset(
-        dataset_uri,
-        **_dataset_load_kwargs(merged_storage_options, namespace_kwargs, block_size),
-    )
-
-    logger.info(
-        "Phase 3: Building and committing index segments for vector index '%s'",
-        name,
-    )
 
     successful_results = [r for r in results if r.get("status") == "success"]
     if not successful_results:
         raise RuntimeError("No successful vector index creation results found")
 
-    updated_dataset = dataset_obj.commit_existing_index_segments(
+    segments = [r["segment_index"] for r in successful_results]
+
+    if target_num_segments is not None and len(segments) > target_num_segments:
+        merge_groups = _plan_segment_merge_groups(
+            successful_results, fragment_sizes, target_num_segments
+        )
+        passthrough_segments = [group[0] for group in merge_groups if len(group) == 1]
+        multi_groups = [group for group in merge_groups if len(group) > 1]
+
+        logger.info(
+            "Phase 2.5: Merging %d segments into %d segments on workers",
+            len(segments),
+            len(merge_groups),
+        )
+
+        merged_segments: list[Any] = []
+        groups_to_merge: list[list[Any]] = []
+        for group in multi_groups:
+            member_keys = [getattr(segment, "uuid", None) for segment in group]
+            cached_merge = (
+                checkpoint.load_merge(member_keys) if checkpoint is not None else None
+            )
+            if cached_merge is not None and not _segment_files_exist(
+                dataset_uri, cached_merge
+            ):
+                logger.warning(
+                    "Checkpointed merged segment %s no longer exists in "
+                    "storage; re-merging the group.",
+                    getattr(cached_merge, "uuid", "<unknown>"),
+                )
+                cached_merge = None
+            if cached_merge is not None:
+                merged_segments.append(cached_merge)
+            else:
+                groups_to_merge.append(group)
+
+        if groups_to_merge:
+
+            def create_merge_handler() -> Any:
+                shared_manifest = _ray_put_index_artifact(serialized_manifest)
+                return _handle_merge_segments(
+                    dataset_uri=dataset_uri,
+                    storage_options=merged_storage_options,
+                    block_size=block_size,
+                    namespace_impl=namespace_impl,
+                    namespace_properties=namespace_properties,
+                    table_id=table_id,
+                    dataset_version=dataset_version,
+                    serialized_manifest=shared_manifest,
+                )
+
+            on_group_merged: Optional[Callable[[list[Any], dict[str, Any]], None]] = (
+                None
+            )
+            if checkpoint is not None:
+                merge_checkpoint = checkpoint
+
+                def _save_merge_on_success(
+                    group: list[Any], result: dict[str, Any]
+                ) -> None:
+                    merge_checkpoint.save_merge(
+                        [getattr(segment, "uuid", None) for segment in group],
+                        result["segment_index"],
+                    )
+
+                on_group_merged = _save_merge_on_success
+
+            merge_results = _map_async_with_pool(
+                create_fragment_handler=create_merge_handler,
+                fragment_batches=groups_to_merge,
+                num_workers=min(num_workers, len(groups_to_merge)),
+                ray_remote_args=ray_remote_args,
+                error_prefix="Failed to merge vector index segments",
+                max_task_retries=max_task_retries,
+                on_success=on_group_merged,
+            )
+            merge_errors = [
+                r["error"] for r in merge_results if r.get("status") == "error"
+            ]
+            if merge_errors:
+                raise RuntimeError(
+                    "Vector index segment merge failed: " + "; ".join(merge_errors)
+                )
+            merged_segments.extend(r["segment_index"] for r in merge_results)
+
+        segments = passthrough_segments + merged_segments
+
+    logger.info(
+        "Phase 3: Committing %d index segments for vector index '%s'",
+        len(segments),
+        name,
+    )
+
+    def load_commit_dataset() -> Any:
+        return LanceDataset(
+            dataset_uri,
+            **_dataset_load_kwargs(
+                merged_storage_options, namespace_kwargs, block_size
+            ),
+        )
+
+    covered_fragment_ids: set[int] = set()
+    for result in successful_results:
+        covered_fragment_ids.update(result.get("fragment_ids", []))
+
+    updated_dataset = _commit_index_segments_with_retry(
+        load_commit_dataset,
         index_name=name,
         column=column,
-        segments=[r["segment_index"] for r in successful_results],
+        segments=segments,
+        covered_fragment_ids=covered_fragment_ids,
+        built_version=dataset_version,
     )
+
+    if checkpoint is not None:
+        checkpoint.clear()
 
     logger.info(
         "Successfully created distributed vector index '%s'",
         name,
     )
     logger.info(
-        "Index ID: %s, Fragments: %d, Workers: %d",
+        "Index ID: %s, Fragments: %d, Batches: %d, Segments committed: %d",
         index_id,
         len(fragment_ids_to_use),
         len(fragment_batches),
+        len(segments),
     )
 
     return updated_dataset
