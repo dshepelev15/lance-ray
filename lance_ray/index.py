@@ -1509,6 +1509,14 @@ def _handle_vector_fragment_index(
 
     def func(fragment_ids: list[int]) -> dict[str, Any]:
         try:
+            # Guard against an arrow-rs u32 overflow in FixedSizeList take():
+            # a large dataset block_size inflates the default scan batch to
+            # block_size/4 rows, and any batch whose rows * dim exceeds 2^32
+            # (e.g. >5.59M rows at dim=768) panics — or, past the wrap
+            # point, silently corrupts vectors — inside Lance's
+            # KeepFiniteVectors transform during the index build.
+            os.environ.setdefault("LANCE_DEFAULT_BATCH_SIZE", "8192")
+
             if not fragment_ids:
                 raise ValueError("fragment_ids cannot be empty")
 

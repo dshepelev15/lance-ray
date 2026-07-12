@@ -1550,3 +1550,37 @@ def test_segment_files_exist_local(tmp_path):
     assert not index_mod._segment_files_exist(str(dataset_dir), missing)
     # Unknown storage schemes are trusted rather than rebuilt.
     assert index_mod._segment_files_exist("memory://fake", missing)
+
+
+def test_vector_fragment_handler_guards_scan_batch_size(monkeypatch):
+    """Worker builds must default LANCE_DEFAULT_BATCH_SIZE to a safe value.
+
+    Without the guard, a large dataset block_size inflates the scan batch to
+    block_size/4 rows; batches with rows * dim > 2^32 hit an arrow-rs
+    FixedSizeList take() overflow (panic or silent vector corruption).
+    """
+    fake_dataset = _FakeDataset()
+    monkeypatch.setattr(index_mod, "LanceDataset", lambda *args, **kwargs: fake_dataset)
+    monkeypatch.delenv("LANCE_DEFAULT_BATCH_SIZE", raising=False)
+
+    handler = index_mod._handle_vector_fragment_index(
+        dataset_uri="memory://fake",
+        column="vector",
+        index_type="IVF_PQ",
+        name="vector_idx",
+        index_uuid="vector-index",
+        replace=False,
+        metric="l2",
+        num_partitions=4,
+        num_sub_vectors=4,
+        ivf_centroids="ivf_centroids",
+        pq_codebook="pq_codebook",
+        block_size=100 * 1024 * 1024,
+    )
+    assert handler([0])["status"] == "success"
+    assert index_mod.os.environ["LANCE_DEFAULT_BATCH_SIZE"] == "8192"
+
+    # An explicit operator-provided value is respected.
+    monkeypatch.setenv("LANCE_DEFAULT_BATCH_SIZE", "4096")
+    assert handler([0])["status"] == "success"
+    assert index_mod.os.environ["LANCE_DEFAULT_BATCH_SIZE"] == "4096"
