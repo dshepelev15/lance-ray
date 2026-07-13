@@ -1576,11 +1576,25 @@ def test_vector_fragment_handler_guards_scan_batch_size(monkeypatch):
         ivf_centroids="ivf_centroids",
         pq_codebook="pq_codebook",
         block_size=100 * 1024 * 1024,
+        dimension=768,
     )
     assert handler([0])["status"] == "success"
-    assert index_mod.os.environ["LANCE_DEFAULT_BATCH_SIZE"] == "8192"
+    assert index_mod.os.environ["LANCE_DEFAULT_BATCH_SIZE"] == "131072"
 
     # An explicit operator-provided value is respected.
     monkeypatch.setenv("LANCE_DEFAULT_BATCH_SIZE", "4096")
     assert handler([0])["status"] == "success"
     assert index_mod.os.environ["LANCE_DEFAULT_BATCH_SIZE"] == "4096"
+
+
+def test_safe_index_build_batch_rows_scales_with_dimension():
+    # Normal embedding dims keep the full default.
+    assert index_mod._safe_index_build_batch_rows(768) == 131072
+    assert index_mod._safe_index_build_batch_rows(None) == 131072
+    # Extreme dims shrink the batch to stay under 2^31 take() elements.
+    assert index_mod._safe_index_build_batch_rows(32768) == 65536
+    assert index_mod._safe_index_build_batch_rows(1 << 22) == 1024
+    # rows * dim never exceeds the safety line for sane dims.
+    for dim in (2, 768, 4096, 32768, 262144):
+        rows = index_mod._safe_index_build_batch_rows(dim)
+        assert rows * dim <= index_mod._SAFE_FSL_TAKE_ELEMENTS or rows == 1024

@@ -1484,6 +1484,22 @@ def _dataset_load_kwargs_with_manifest(
     return load_kwargs
 
 
+# Default scan batch (rows) for worker-side index builds. Large enough to
+# keep object-store reads and SIMD pipelines busy, and far below the arrow-rs
+# FixedSizeList take() overflow threshold for any realistic dimension.
+_DEFAULT_INDEX_BUILD_BATCH_ROWS = 131072
+# Cap batches so rows * dim stays under 2^31 — half the u32 threshold at
+# which arrow-rs take() panics on (or silently corrupts) FixedSizeList data.
+_SAFE_FSL_TAKE_ELEMENTS = 1 << 31
+
+
+def _safe_index_build_batch_rows(dimension: Optional[int]) -> int:
+    batch_rows = _DEFAULT_INDEX_BUILD_BATCH_ROWS
+    if dimension and dimension > 0:
+        batch_rows = min(batch_rows, _SAFE_FSL_TAKE_ELEMENTS // dimension)
+    return max(batch_rows, 1024)
+
+
 def _handle_vector_fragment_index(
     dataset_uri: str,
     column: str,
@@ -1503,6 +1519,7 @@ def _handle_vector_fragment_index(
     table_id: Optional[list[str]] = None,
     dataset_version: Optional[int] = None,
     serialized_manifest: Any = None,
+    dimension: Optional[int] = None,
     **kwargs: Any,
 ):
     """Create a fragment handler closure for vector index builds."""
@@ -1515,7 +1532,10 @@ def _handle_vector_fragment_index(
             # (e.g. >5.59M rows at dim=768) panics — or, past the wrap
             # point, silently corrupts vectors — inside Lance's
             # KeepFiniteVectors transform during the index build.
-            os.environ.setdefault("LANCE_DEFAULT_BATCH_SIZE", "8192")
+            os.environ.setdefault(
+                "LANCE_DEFAULT_BATCH_SIZE",
+                str(_safe_index_build_batch_rows(dimension)),
+            )
 
             if not fragment_ids:
                 raise ValueError("fragment_ids cannot be empty")
@@ -2231,6 +2251,7 @@ def create_index(
             table_id=table_id,
             dataset_version=dataset_version,
             serialized_manifest=shared_manifest,
+            dimension=dimension,
             **index_build_kwargs,
         )
 
