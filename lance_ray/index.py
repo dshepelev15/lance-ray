@@ -6,7 +6,9 @@ from __future__ import annotations
 import logging
 import math
 import os
+import time
 import uuid
+from collections import deque
 from collections.abc import Callable
 from typing import Any, Literal, Optional, TypeAlias, cast, get_args
 
@@ -17,7 +19,7 @@ from lance.bitmap import Bitmap
 from lance.dataset import Index, IndexConfig, LanceDataset
 from lance.indices import IndicesBuilder
 from packaging import version
-from ray.util.multiprocessing import Pool
+from ray.exceptions import ActorUnavailableError
 
 from .field_path import resolve_arrow_field_path, resolve_dataset_field_path
 from .utils import (
@@ -140,6 +142,13 @@ def _distribute_fragments_balanced(
     return non_empty_batches
 
 
+class _BatchWorker:
+    """Ray actor that runs one fragment-batch handler call at a time."""
+
+    def run(self, handler: _FragmentHandler, fragment_ids: list[int]) -> dict[str, Any]:
+        return handler(fragment_ids)
+
+
 def _map_async_with_pool(
     create_fragment_handler: Callable[[], _FragmentHandler],
     fragment_batches: list[list[int]],
@@ -147,29 +156,88 @@ def _map_async_with_pool(
     num_workers: int,
     ray_remote_args: Optional[dict[str, Any]],
     error_prefix: str,
+    max_task_retries: int = 0,
 ) -> list[dict[str, Any]]:
-    """Run fragment tasks in a Ray-backed multiprocessing Pool.
+    """Run fragment batches on a pool of Ray actors, one batch per idle worker.
 
-    This helper encapsulates the common Pool.map_async + get + error wrapping
-    logic so that both scalar and vector distributed index builders can share
-    the same implementation.
+    Each batch is handed to whichever worker is idle at that moment, so a slow
+    node only delays the batches it is actually running. (Ray's
+    ``multiprocessing.Pool`` assigns batches round-robin at submission time,
+    which makes a map of N batches wait for the slowest worker's fixed share
+    of N.) Batches whose handler returned ``{"status": "error"}`` or whose
+    Ray task/actor failed are resubmitted immediately, up to
+    ``max_task_retries`` times each, rather than after every other batch has
+    finished; handlers must therefore be idempotent.
+
+    Workers are actors created with ``ray_remote_args`` (``num_cpus=0`` unless
+    given, like Ray's Pool). A worker whose process dies is dropped from the
+    pool unless ``{"max_restarts": ...}`` is set, in which case Ray restarts
+    it and it keeps receiving batches.
     """
-    pool = Pool(processes=num_workers, ray_remote_args=ray_remote_args)
+    remote_args = {"num_cpus": 0, **(ray_remote_args or {})}
+    worker_cls: Any = ray.remote(**remote_args)(_BatchWorker)
+    workers: list[Any] = [worker_cls.remote() for _ in range(num_workers)]
     try:
         fragment_handler = create_fragment_handler()
-        rst_futures = pool.map_async(
-            fragment_handler,
-            fragment_batches,
-            chunksize=1,
+        results: dict[int, dict[str, Any]] = {}
+        pending: deque[tuple[int, int]] = deque(
+            (index, 0) for index in range(len(fragment_batches))
         )
-        results: list[dict[str, Any]] = rst_futures.get()
-    except Exception as exc:  # pragma: no cover - exercised via integration tests
+        idle: list[Any] = []
+        # A worker joins the idle list once Ray has actually started it, so a
+        # batch never queues on an actor still waiting for cluster resources.
+        starting: dict[Any, Any] = {w.__ray_ready__.remote(): w for w in workers}
+        in_flight: dict[Any, tuple[Any, int, int]] = {}
+        while pending or in_flight:
+            while pending and idle:
+                index, attempt = pending.popleft()
+                worker = idle.pop()
+                ref = worker.run.remote(fragment_handler, fragment_batches[index])
+                in_flight[ref] = (worker, index, attempt)
+            if not in_flight and not starting:
+                raise RuntimeError("every worker has died")
+            [ref], _ = ray.wait(list(in_flight) + list(starting), num_returns=1)
+            if ref in starting:
+                worker = starting.pop(ref)
+                try:
+                    ray.get(ref)
+                    idle.append(worker)
+                except ActorUnavailableError:
+                    # Restarting under max_restarts: probe again shortly.
+                    time.sleep(0.5)
+                    starting[worker.__ray_ready__.remote()] = worker
+                except Exception as exc:
+                    logger.warning(
+                        "Worker unavailable (%s); dropping it. Pass max_restarts "
+                        "in ray_remote_args to restart dead workers",
+                        exc,
+                    )
+                continue
+            worker, index, attempt = in_flight.pop(ref)
+            try:
+                result = ray.get(ref)
+                idle.append(worker)
+            except Exception as exc:
+                result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                # A live worker is ready again at once; a dead one is dropped
+                # (or, with max_restarts, restarted) by the start path above.
+                starting[worker.__ray_ready__.remote()] = worker
+            results[index] = result
+            if result.get("status") != "success" and attempt < max_task_retries:
+                logger.warning(
+                    "Batch %d failed (attempt %d of %d): %s; resubmitting",
+                    index,
+                    attempt + 1,
+                    max_task_retries + 1,
+                    result.get("error"),
+                )
+                pending.append((index, attempt + 1))
+        return [results[i] for i in range(len(fragment_batches))]
+    except Exception as exc:
         raise RuntimeError(f"{error_prefix}: {exc}") from exc
     finally:
-        pool.close()
-        pool.join()
-
-    return results
+        for worker in workers:
+            ray.kill(worker)
 
 
 def _resolve_num_segments(num_workers: int, num_segments: Optional[int]) -> int:
@@ -1268,6 +1336,7 @@ def create_index(
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
+    max_task_retries: int = 0,
     metric: str = "l2",
     num_partitions: Optional[int] = None,
     num_sub_vectors: Optional[int] = None,
@@ -1295,6 +1364,10 @@ def create_index(
         storage_options: Storage options for the dataset (keyword-only)
         block_size: Block size in bytes to use when loading the dataset (keyword-only)
         ray_remote_args: Options for Ray tasks (keyword-only)
+        max_task_retries: How many times a failed fragment batch is
+            resubmitted to another worker before the build fails. Batches are
+            retried as soon as they fail, so a transient object-store error
+            costs one batch rather than a build (default: 0)
         metric: Distance metric to use (default: "l2")
         num_partitions: Number of IVF partitions (optional)
         num_sub_vectors: Number of PQ sub-vectors (optional)
@@ -1322,6 +1395,11 @@ def create_index(
 
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+
+    if max_task_retries < 0:
+        raise ValueError(
+            f"max_task_retries must be non-negative, got {max_task_retries}"
+        )
 
     if block_size is not None and block_size <= 0:
         raise ValueError(f"block_size must be positive, got {block_size}")
@@ -1543,6 +1621,7 @@ def create_index(
         num_workers=pool_workers,
         ray_remote_args=ray_remote_args,
         error_prefix="Failed to complete distributed vector index building",
+        max_task_retries=max_task_retries,
     )
 
     failed_results = [r for r in results if r.get("status") == "error"]

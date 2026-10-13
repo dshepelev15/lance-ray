@@ -115,6 +115,7 @@ def create_index(
     namespace_properties: Optional[dict[str, str]] = None,
     table_id: Optional[list[str]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
+    max_task_retries: int = 0,
     metric: str = "l2",
     num_partitions: Optional[int] = None,
     num_sub_vectors: Optional[int] = None,
@@ -142,7 +143,8 @@ def create_index(
 | `namespace_impl` | `str`, optional | The namespace implementation type (e.g., `"rest"`, `"dir"`) |
 | `namespace_properties` | `Dict[str, str]`, optional | Properties for connecting to the namespace |
 | `table_id` | `list[str]`, optional | The table identifier as a list of strings. Must be provided together with `namespace_impl`. |
-| `ray_remote_args` | `Dict[str, Any]`, optional | Ray task options (e.g., `num_cpus`, `resources`). `num_cpus` also sizes Lance's compute thread pool on each worker (`LANCE_CPU_THREADS`), so several workers can share a node without oversubscribing it |
+| `ray_remote_args` | `Dict[str, Any]`, optional | Ray actor options for the workers (e.g., `num_cpus`, `resources`). `num_cpus` also sizes Lance's compute thread pool on each worker (`LANCE_CPU_THREADS`), so several workers can share a node without oversubscribing it. Add `max_restarts` so a worker whose process crashes is restarted instead of dropped |
+| `max_task_retries` | `int`, optional | How many times a failed fragment batch is resubmitted to another idle worker before the build fails, default is 0. Batches are retried as soon as they fail |
 | `metric` | `str`, optional | Distance metric to use (e.g., `"l2"`, `"cosine"`, `"dot"`, `"hamming"`), default is `"l2"` |
 | `num_partitions` | `int`, optional | Number of IVF partitions |
 | `num_sub_vectors` | `int`, optional | Number of PQ sub-vectors |

@@ -10,6 +10,8 @@ from typing import Any, cast
 import pyarrow as pa
 import pytest
 
+from _ray_test_support import attempt_marker, die_once_handler, timed_sleep_handler
+
 
 def _load_index_module_with_stubs() -> ModuleType:
     """Load lance_ray.index when the native pylance extension is unavailable."""
@@ -31,17 +33,17 @@ def _load_index_module_with_stubs() -> ModuleType:
 
     ray = ModuleType("ray")
     ray.ObjectRef = type("ObjectRef", (), {})  # type: ignore[attr-defined]
-    ray_util = ModuleType("ray.util")
-    ray_multiprocessing = ModuleType("ray.util.multiprocessing")
-    ray_multiprocessing.Pool = object  # type: ignore[attr-defined]
 
     sys.modules["lance_ray"] = package
     sys.modules["lance"] = lance
     sys.modules["lance.dataset"] = lance_dataset
     sys.modules["lance.indices"] = lance_indices
+    ray_exceptions = ModuleType("ray.exceptions")
+    ray_exceptions.ActorUnavailableError = type(  # type: ignore[attr-defined]
+        "ActorUnavailableError", (Exception,), {}
+    )
     sys.modules["ray"] = ray
-    sys.modules["ray.util"] = ray_util
-    sys.modules["ray.util.multiprocessing"] = ray_multiprocessing
+    sys.modules["ray.exceptions"] = ray_exceptions
 
     spec = importlib.util.spec_from_file_location(
         "lance_ray.index",
@@ -138,55 +140,128 @@ class _FakeDataset:
         return self
 
 
-def test_map_async_with_pool_closes_and_joins_pool(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The Ray Pool should be joined after close so actors finish cleanup."""
+def test_map_async_with_pool_dispatches_to_idle_workers() -> None:
+    """A batch goes to a free worker instead of queueing behind a slow one.
 
-    events: list[Any] = []
-
-    class FakeAsyncResult:
-        def get(self) -> Any:
-            events.append("get")
-            return [{"status": "success"}]
-
-    class FakePool:
-        def __init__(self, processes: int, ray_remote_args: Any) -> None:
-            events.append(("init", processes, ray_remote_args))
-
-        def map_async(
-            self, fragment_handler: Any, fragment_batches: Any, chunksize: int
-        ) -> Any:
-            events.append(("map_async", fragment_batches, chunksize))
-            return FakeAsyncResult()
-
-        def close(self) -> None:
-            events.append("close")
-
-        def join(self) -> None:
-            events.append("join")
-
-    def create_fragment_handler() -> Any:
-        events.append("create_handler")
-        return lambda fragment_ids: {"status": "success", "fragment_ids": fragment_ids}
-
-    monkeypatch.setattr(index_mod, "Pool", FakePool)
-
-    assert index_mod._map_async_with_pool(
-        create_fragment_handler=create_fragment_handler,
-        fragment_batches=[[0, 1]],
+    With two workers and batches [slow, fast, slow, fast], round-robin
+    submission would put both slow batches on the same worker, one after the
+    other; idle dispatch runs them concurrently on different workers.
+    """
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: timed_sleep_handler,
+        fragment_batches=[[200], [5], [200], [5]],
         num_workers=2,
         ray_remote_args={"num_cpus": 1},
         error_prefix="failed",
-    ) == [{"status": "success"}]
-    assert events == [
-        ("init", 2, {"num_cpus": 1}),
-        "create_handler",
-        ("map_async", [[0, 1]], 1),
-        "get",
-        "close",
-        "join",
-    ]
+    )
+
+    assert [r["status"] for r in results] == ["success"] * 4
+    assert results[2]["start"] < results[0]["end"]
+
+
+def test_map_async_with_pool_retries_failed_tasks(tmp_path: Path) -> None:
+    marker_dir = str(tmp_path)
+
+    def handler(fragment_ids: list[int]) -> dict[str, Any]:
+        attempt = attempt_marker(marker_dir, fragment_ids)
+        if fragment_ids == [1] and attempt == 1:
+            return {"status": "error", "fragment_ids": fragment_ids, "error": "boom"}
+        return {"status": "success", "fragment_ids": fragment_ids}
+
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: handler,
+        fragment_batches=[[0], [1], [2]],
+        num_workers=2,
+        ray_remote_args=None,
+        error_prefix="failed",
+        max_task_retries=1,
+    )
+
+    assert [r["fragment_ids"] for r in results] == [[0], [1], [2]]
+    assert [r["status"] for r in results] == ["success"] * 3
+    attempts = sorted(name.split(".")[0] for name in os.listdir(marker_dir))
+    assert attempts == ["0", "1", "1", "2"]
+
+
+def test_map_async_with_pool_reports_exhausted_retries(tmp_path: Path) -> None:
+    marker_dir = str(tmp_path)
+
+    def handler(fragment_ids: list[int]) -> dict[str, Any]:
+        attempt_marker(marker_dir, fragment_ids)
+        return {"status": "error", "fragment_ids": fragment_ids, "error": "boom"}
+
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: handler,
+        fragment_batches=[[0]],
+        num_workers=1,
+        ray_remote_args=None,
+        error_prefix="failed",
+        max_task_retries=2,
+    )
+
+    assert results == [{"status": "error", "fragment_ids": [0], "error": "boom"}]
+    assert len(os.listdir(marker_dir)) == 3
+
+
+def test_map_async_with_pool_retries_on_a_live_worker_after_worker_death(
+    tmp_path: Path,
+) -> None:
+    """A batch whose worker dies is retried elsewhere; the dead worker is dropped."""
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: die_once_handler(str(tmp_path / "died")),
+        fragment_batches=[[0], [1]],
+        num_workers=2,
+        ray_remote_args=None,
+        error_prefix="failed",
+        max_task_retries=1,
+    )
+
+    assert [r["status"] for r in results] == ["success", "success"]
+
+
+def test_map_async_with_pool_keeps_restartable_workers_after_death(
+    tmp_path: Path,
+) -> None:
+    """With max_restarts, Ray restarts the dead worker and it keeps serving."""
+    results = index_mod._map_async_with_pool(
+        create_fragment_handler=lambda: die_once_handler(str(tmp_path / "died")),
+        fragment_batches=[[0]],
+        num_workers=1,
+        ray_remote_args={"max_restarts": 1},
+        error_prefix="failed",
+        max_task_retries=1,
+    )
+
+    assert results[0]["status"] == "success"
+
+
+def test_map_async_with_pool_fails_when_every_worker_died() -> None:
+    def handler(fragment_ids: list[int]) -> dict[str, Any]:
+        os._exit(1)
+
+    with pytest.raises(RuntimeError, match="failed: every worker has died"):
+        index_mod._map_async_with_pool(
+            create_fragment_handler=lambda: handler,
+            fragment_batches=[[0]],
+            num_workers=1,
+            ray_remote_args=None,
+            error_prefix="failed",
+            max_task_retries=1,
+        )
+
+
+def test_create_index_rejects_negative_max_task_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(index_mod, "_check_pylance_version", lambda: None)
+
+    with pytest.raises(ValueError, match="max_task_retries must be non-negative"):
+        index_mod.create_index(
+            uri="memory://fake",
+            column="vector",
+            index_type="IVF_PQ",
+            max_task_retries=-1,
+        )
 
 
 def test_create_index_passes_global_training_options_to_segment_build(

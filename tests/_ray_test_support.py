@@ -6,7 +6,10 @@ inside Ray worker processes via ``runtime_env.worker_process_setup_hook``.
 
 from __future__ import annotations
 
+import os
 import threading
+import time
+from collections.abc import Callable
 from typing import Any, Optional
 
 
@@ -120,3 +123,38 @@ def setup_worker() -> None:
     """
     patch_memory_profiler()
     patch_psutil_for_containers()
+
+
+# Handlers that the index pool tests run inside Ray workers. They live here,
+# not in the test module, because workers already import this module (it is
+# the worker_process_setup_hook) but cannot import a module that imports pytest.
+
+
+def timed_sleep_handler(batch: list[int]) -> dict[str, Any]:
+    """Sleep batch[0] / 100 seconds and report wall-clock start and end."""
+    start = time.time()
+    time.sleep(batch[0] / 100)
+    return {"status": "success", "start": start, "end": time.time()}
+
+
+def attempt_marker(marker_dir: str, fragment_ids: list[int]) -> int:
+    """Record one handler attempt on disk and return the attempt number."""
+    marker = os.path.join(
+        marker_dir, f"{fragment_ids[0]}.{os.getpid()}.{time.time_ns()}"
+    )
+    open(marker, "w").close()
+    return len(
+        [f for f in os.listdir(marker_dir) if f.startswith(f"{fragment_ids[0]}.")]
+    )
+
+
+def die_once_handler(marker: str) -> Callable[[list[int]], dict[str, Any]]:
+    """Batch [0] kills its worker process on the first attempt only."""
+
+    def handler(fragment_ids: list[int]) -> dict[str, Any]:
+        if fragment_ids == [0] and not os.path.exists(marker):
+            open(marker, "w").close()
+            os._exit(1)  # the worker process dies mid-batch
+        return {"status": "success", "fragment_ids": fragment_ids}
+
+    return handler
