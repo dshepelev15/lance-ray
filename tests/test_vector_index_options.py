@@ -1,6 +1,7 @@
 """Tests for distributed vector index option handling."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -707,3 +708,76 @@ def test_vector_fragment_handler_resolves_shared_artifact_refs(
     assert captured["gets"] == [ivf_ref, pq_ref]
     assert fake_dataset.vector_index_kwargs["ivf_centroids"] == "ivf_centroids"
     assert fake_dataset.vector_index_kwargs["pq_codebook"] == "pq_codebook"
+
+
+def _fake_runtime_context(
+    monkeypatch: pytest.MonkeyPatch, resources: dict[str, float]
+) -> None:
+    monkeypatch.setattr(
+        index_mod.ray,  # type: ignore[attr-defined]
+        "get_runtime_context",
+        lambda: SimpleNamespace(get_assigned_resources=lambda: resources),
+        raising=False,
+    )
+
+
+def test_pin_lance_cpu_threads_uses_assigned_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {"CPU": 8.0, "memory": 1024})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert os.environ["LANCE_CPU_THREADS"] == "8"
+
+
+def test_pin_lance_cpu_threads_keeps_explicit_setting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANCE_CPU_THREADS", "3")
+    _fake_runtime_context(monkeypatch, {"CPU": 8.0})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert os.environ["LANCE_CPU_THREADS"] == "3"
+
+
+def test_pin_lance_cpu_threads_skips_workers_without_cpus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert "LANCE_CPU_THREADS" not in os.environ
+
+
+def test_vector_fragment_handler_pins_lance_cpu_threads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {"CPU": 16.0})
+    fake_dataset: Any = _FakeDataset()
+    monkeypatch.setattr(index_mod, "LanceDataset", lambda *args, **kwargs: fake_dataset)
+
+    handler = index_mod._handle_vector_fragment_index(
+        dataset_uri="memory://fake",
+        column="vector",
+        index_type="IVF_FLAT",
+        name="vector_idx",
+        index_uuid="vector-index",
+        replace=False,
+        metric="l2",
+        num_partitions=4,
+        num_sub_vectors=None,
+        ivf_centroids=cast(Any, "ivf_centroids"),
+        pq_codebook=None,
+    )
+
+    assert handler([0])["status"] == "success"
+    assert os.environ["LANCE_CPU_THREADS"] == "16"

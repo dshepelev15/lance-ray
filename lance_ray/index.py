@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 import uuid
 from collections.abc import Callable
 from typing import Any, Literal, Optional, TypeAlias, cast, get_args
@@ -1134,6 +1135,24 @@ def _validate_metric(metric: str) -> str:
     return metric_lower
 
 
+def _pin_lance_cpu_threads() -> None:
+    """Size Lance's compute thread pool to this worker's Ray CPU allocation.
+
+    Lance sizes its pools from the host core count, so two 8-CPU workers on a
+    16-core node would each start 16 compute threads and oversubscribe the
+    node. Must run before the process makes its first Lance call; an explicit
+    ``LANCE_CPU_THREADS`` is left untouched.
+    """
+    if "LANCE_CPU_THREADS" in os.environ:
+        return
+    try:
+        cpus = ray.get_runtime_context().get_assigned_resources().get("CPU", 0)
+    except Exception:  # not running inside a Ray worker
+        return
+    if cpus >= 1:
+        os.environ["LANCE_CPU_THREADS"] = str(int(cpus))
+
+
 def _handle_vector_fragment_index(
     dataset_uri: str,
     column: str,
@@ -1158,6 +1177,7 @@ def _handle_vector_fragment_index(
 
     def func(fragment_ids: list[int]) -> dict[str, Any]:
         try:
+            _pin_lance_cpu_threads()
             if not fragment_ids:
                 raise ValueError("fragment_ids cannot be empty")
 
