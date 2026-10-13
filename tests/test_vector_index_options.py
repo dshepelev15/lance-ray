@@ -1,6 +1,7 @@
 """Tests for distributed vector index option handling."""
 
 import importlib.util
+import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -1598,3 +1599,64 @@ def test_safe_index_build_batch_rows_scales_with_dimension():
     for dim in (2, 768, 4096, 32768, 262144):
         rows = index_mod._safe_index_build_batch_rows(dim)
         assert rows * dim <= index_mod._SAFE_FSL_TAKE_ELEMENTS or rows == 1024
+
+
+def _fake_runtime_context(monkeypatch, resources):
+    monkeypatch.setattr(
+        index_mod.ray,
+        "get_runtime_context",
+        lambda: SimpleNamespace(get_assigned_resources=lambda: resources),
+    )
+
+
+def test_pin_lance_cpu_threads_uses_assigned_cpus(monkeypatch):
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {"CPU": 8.0, "memory": 1024})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert os.environ["LANCE_CPU_THREADS"] == "8"
+
+
+def test_pin_lance_cpu_threads_keeps_explicit_setting(monkeypatch):
+    monkeypatch.setenv("LANCE_CPU_THREADS", "3")
+    _fake_runtime_context(monkeypatch, {"CPU": 8.0})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert os.environ["LANCE_CPU_THREADS"] == "3"
+
+
+def test_pin_lance_cpu_threads_skips_workers_without_cpus(monkeypatch):
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {})
+
+    index_mod._pin_lance_cpu_threads()
+
+    assert "LANCE_CPU_THREADS" not in os.environ
+
+
+def test_vector_fragment_handler_pins_lance_cpu_threads(monkeypatch):
+    monkeypatch.setenv("LANCE_CPU_THREADS", "unset")
+    monkeypatch.delenv("LANCE_CPU_THREADS")
+    _fake_runtime_context(monkeypatch, {"CPU": 16.0})
+    monkeypatch.setattr(index_mod, "LanceDataset", lambda *a, **k: _FakeDataset())
+
+    handler = index_mod._handle_vector_fragment_index(
+        dataset_uri="memory://fake",
+        column="vector",
+        index_type="IVF_FLAT",
+        name="vector_idx",
+        index_uuid="vector-index",
+        replace=False,
+        metric="l2",
+        num_partitions=4,
+        num_sub_vectors=None,
+        ivf_centroids="ivf_centroids",
+        pq_codebook=None,
+    )
+
+    assert handler([0])["status"] == "success"
+    assert os.environ["LANCE_CPU_THREADS"] == "16"

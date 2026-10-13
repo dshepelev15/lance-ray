@@ -138,7 +138,7 @@ def create_index(
 | `namespace_impl` | `str`, optional | The namespace implementation type (e.g., `"rest"`, `"dir"`) |
 | `namespace_properties` | `Dict[str, str]`, optional | Properties for connecting to the namespace |
 | `table_id` | `list[str]`, optional | The table identifier as a list of strings. Must be provided together with `namespace_impl`. |
-| `ray_remote_args` | `Dict[str, Any]`, optional | Ray task options (e.g., `num_cpus`, `resources`) |
+| `ray_remote_args` | `Dict[str, Any]`, optional | Ray task options (e.g., `num_cpus`, `resources`). `num_cpus` also sizes Lance's compute thread pool on each worker (`LANCE_CPU_THREADS`), so several workers can share a node without oversubscribing it |
 | `metric` | `str`, optional | Distance metric to use (e.g., `"l2"`, `"cosine"`, `"dot"`, `"hamming"`), default is `"l2"` |
 | `num_partitions` | `int`, optional | Number of IVF partitions |
 | `num_sub_vectors` | `int`, optional | Number of PQ sub-vectors |
