@@ -116,6 +116,8 @@ def create_index(
     table_id: Optional[list[str]] = None,
     ray_remote_args: Optional[dict[str, Any]] = None,
     max_task_retries: int = 0,
+    training_ray_remote_args: Optional[dict[str, Any]] = None,
+    accelerator: Optional[Any] = None,
     metric: str = "l2",
     num_partitions: Optional[int] = None,
     num_sub_vectors: Optional[int] = None,
@@ -145,6 +147,8 @@ def create_index(
 | `table_id` | `list[str]`, optional | The table identifier as a list of strings. Must be provided together with `namespace_impl`. |
 | `ray_remote_args` | `Dict[str, Any]`, optional | Ray actor options for the workers (e.g., `num_cpus`, `resources`). `num_cpus` also sizes Lance's compute thread pool on each worker (`LANCE_CPU_THREADS`), so several workers can share a node without oversubscribing it. Add `max_restarts` so a worker whose process crashes is restarted instead of dropped |
 | `max_task_retries` | `int`, optional | How many times a failed fragment batch is resubmitted to another idle worker before the build fails, default is 0. Batches are retried as soon as they fail |
+| `training_ray_remote_args` | `Dict[str, Any]`, optional | When set, Phase 1 (IVF/PQ training and the RaBitQ model) runs as a Ray task with these options instead of on the driver, e.g. `{"num_cpus": 16, "memory": 64 * 2**30}` to keep a small head node out of k-means, or `{"num_gpus": 1}` with `accelerator="cuda"` to train on a GPU node. The dataset is handed to the task pinned to the version the build was planned on |
+| `accelerator` | `str` or `torch.Device`, optional | Accelerator for Phase 1 IVF centroid training, e.g. `"cuda"` or `"mps"`. Not forwarded to fragment workers, whose builds run on CPU |
 | `metric` | `str`, optional | Distance metric to use (e.g., `"l2"`, `"cosine"`, `"dot"`, `"hamming"`), default is `"l2"` |
 | `num_partitions` | `int`, optional | Number of IVF partitions |
 | `num_sub_vectors` | `int`, optional | Number of PQ sub-vectors |

@@ -264,27 +264,22 @@ def test_create_index_rejects_negative_max_task_retries(
         )
 
 
-def test_create_index_passes_global_training_options_to_segment_build(
-    monkeypatch: pytest.MonkeyPatch,
+def _patch_create_index(
+    monkeypatch: pytest.MonkeyPatch, fake_dataset: Any, captured: dict[str, Any]
 ) -> None:
-    """Global training options must reach driver training and segment builds."""
-
-    captured: dict[str, Any] = {}
-    fake_dataset: Any = _FakeDataset()
+    """Fake training, artifact broadcast and the worker pool around create_index."""
 
     class FakeIndicesBuilder:
         dimension = 16
 
         def __init__(self, dataset: Any, column: str) -> None:
             captured["builder_dataset"] = dataset
-            captured["builder_column"] = column
 
         def train_ivf(self, **kwargs: Any) -> Any:
             captured["train_ivf"] = kwargs
             return SimpleNamespace(centroids="ivf_centroids", num_partitions=4)
 
         def train_pq(self, ivf_model: Any, **kwargs: Any) -> Any:
-            captured["train_pq_ivf_model"] = ivf_model
             captured["train_pq"] = kwargs
             return SimpleNamespace(codebook="pq_codebook", num_subvectors=4)
 
@@ -293,7 +288,6 @@ def test_create_index_passes_global_training_options_to_segment_build(
         return "ivf_ref", "pq_ref"
 
     def fake_map_async_with_pool(**kwargs: Any) -> Any:
-        captured["map_kwargs"] = kwargs
         fragment_handler = kwargs["create_fragment_handler"]()
         return [fragment_handler([0, 1])]
 
@@ -306,6 +300,16 @@ def test_create_index_passes_global_training_options_to_segment_build(
         fake_put_vector_index_artifacts,
     )
     monkeypatch.setattr(index_mod, "_map_async_with_pool", fake_map_async_with_pool)
+
+
+def test_create_index_passes_global_training_options_to_segment_build(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Global training options must reach driver training and segment builds."""
+
+    captured: dict[str, Any] = {}
+    fake_dataset: Any = _FakeDataset()
+    _patch_create_index(monkeypatch, fake_dataset, captured)
 
     updated_dataset: Any = index_mod.create_index(
         uri=fake_dataset,
@@ -856,3 +860,42 @@ def test_vector_fragment_handler_pins_lance_cpu_threads(
 
     assert handler([0])["status"] == "success"
     assert os.environ["LANCE_CPU_THREADS"] == "16"
+
+
+def test_create_index_trains_on_ray_worker_when_requested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """training_ray_remote_args runs Phase 1 as a Ray task on the pinned version."""
+
+    captured: dict[str, Any] = {}
+    fake_dataset: Any = _FakeDataset()
+    _patch_create_index(monkeypatch, fake_dataset, captured)
+
+    class FakeTask:
+        def options(self, **kwargs: Any) -> "FakeTask":
+            captured["task_options"] = kwargs
+            return self
+
+        def remote(self, *args: Any, **kwargs: Any) -> Any:
+            captured["task_args"] = (args, kwargs)
+            return index_mod._train_vector_index_models(*args, **kwargs)
+
+    monkeypatch.setattr(index_mod.ray, "remote", lambda fn: FakeTask(), raising=False)  # type: ignore[attr-defined]
+    monkeypatch.setattr(index_mod.ray, "get", lambda value: value, raising=False)  # type: ignore[attr-defined]
+
+    index_mod.create_index(
+        uri=fake_dataset,
+        column="vector",
+        index_type="IVF_PQ",
+        num_workers=2,
+        num_partitions=4,
+        num_sub_vectors=4,
+        accelerator="cuda",
+        training_ray_remote_args={"num_gpus": 1, "num_cpus": 8},
+    )
+
+    assert captured["task_options"] == {"num_gpus": 1, "num_cpus": 8}
+    assert captured["task_args"][0] == (fake_dataset,)
+    assert captured["train_ivf"]["accelerator"] == "cuda"
+    assert "accelerator" not in fake_dataset.vector_index_kwargs
+    assert fake_dataset.commit_kwargs["segments"] == ["segment"]

@@ -2081,3 +2081,31 @@ def test_build_distributed_btree_index_on_large_string(
         filter="large_text = 'value-03'", columns=["id"]
     ).to_table()
     assert results.column("id").to_pylist() == [3]
+
+
+def test_build_distributed_vector_index_trains_on_ray_task(tmp_path: Path) -> None:
+    """Phase 1 runs as a Ray task; the dataset travels pickled with its version."""
+    dataset_uri = generate_multi_fragment_vector_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=1024, dim=128
+    )
+
+    updated_dataset = lr.create_index(
+        uri=dataset_uri,
+        column="vector",
+        index_type="IVF_PQ",
+        name="idx_remote_training",
+        num_workers=2,
+        num_segments=2,
+        num_partitions=4,
+        num_sub_vectors=16,
+        num_bits=4,
+        sample_rate=4,
+        training_ray_remote_args={"num_cpus": 1},
+    )
+
+    indices = {idx.name: idx for idx in updated_dataset.describe_indices()}
+    assert indices["idx_remote_training"].index_type == "IVF_PQ"
+
+    q = [random.gauss(0, 1) for _ in range(128)]
+    result = updated_dataset.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert result.num_rows == 5
