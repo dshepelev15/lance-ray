@@ -1500,6 +1500,24 @@ def _safe_index_build_batch_rows(dimension: Optional[int]) -> int:
     return max(batch_rows, 1024)
 
 
+def _pin_lance_cpu_threads() -> None:
+    """Size Lance's compute thread pool to this worker's Ray CPU allocation.
+
+    Lance sizes its pools from the host core count, so two 8-CPU workers on a
+    16-core node would each start 16 compute threads and oversubscribe the
+    node. Must run before the process makes its first Lance call; an explicit
+    ``LANCE_CPU_THREADS`` is left untouched.
+    """
+    if "LANCE_CPU_THREADS" in os.environ:
+        return
+    try:
+        cpus = ray.get_runtime_context().get_assigned_resources().get("CPU", 0)
+    except Exception:  # not running inside a Ray worker
+        return
+    if cpus >= 1:
+        os.environ["LANCE_CPU_THREADS"] = str(int(cpus))
+
+
 def _handle_vector_fragment_index(
     dataset_uri: str,
     column: str,
@@ -1526,6 +1544,7 @@ def _handle_vector_fragment_index(
 
     def func(fragment_ids: list[int]) -> dict[str, Any]:
         try:
+            _pin_lance_cpu_threads()
             # Guard against an arrow-rs u32 overflow in FixedSizeList take():
             # a large dataset block_size inflates the default scan batch to
             # block_size/4 rows, and any batch whose rows * dim exceeds 2^32
@@ -1633,6 +1652,7 @@ def _handle_merge_segments(
 
     def func(segment_group: list[Any]) -> dict[str, Any]:
         try:
+            _pin_lance_cpu_threads()
             segments = list(segment_group)
             if not segments:
                 raise ValueError("segment group cannot be empty")
