@@ -1598,3 +1598,54 @@ def test_safe_index_build_batch_rows_scales_with_dimension():
     for dim in (2, 768, 4096, 32768, 262144):
         rows = index_mod._safe_index_build_batch_rows(dim)
         assert rows * dim <= index_mod._SAFE_FSL_TAKE_ELEMENTS or rows == 1024
+
+
+def test_create_index_trains_on_ray_worker_when_requested(monkeypatch):
+    """training_ray_remote_args runs Phase 1 as a Ray task on the pinned version."""
+
+    captured = {}
+    fake_dataset = _FakeDataset()
+
+    class FakeIndicesBuilder:
+        dimension = 16
+
+        def __init__(self, dataset, column):
+            captured["builder_dataset"] = dataset
+
+        def train_ivf(self, **kwargs):
+            captured["train_ivf"] = kwargs
+            return SimpleNamespace(centroids="ivf_centroids", num_partitions=4)
+
+        def train_pq(self, ivf_model, **kwargs):
+            captured["train_pq"] = kwargs
+            return SimpleNamespace(codebook="pq_codebook", num_subvectors=4)
+
+    class FakeTask:
+        def options(self, **kwargs):
+            captured["task_options"] = kwargs
+            return self
+
+        def remote(self, *args, **kwargs):
+            captured["task_args"] = (args, kwargs)
+            return index_mod._train_vector_index_models(*args, **kwargs)
+
+    _patch_common(monkeypatch, fake_dataset, captured, FakeIndicesBuilder)
+    monkeypatch.setattr(index_mod.ray, "remote", lambda fn: FakeTask())
+    monkeypatch.setattr(index_mod.ray, "get", lambda value: value)
+
+    index_mod.create_index(
+        uri=fake_dataset,
+        column="vector",
+        index_type="IVF_PQ",
+        num_workers=2,
+        num_partitions=4,
+        num_sub_vectors=4,
+        accelerator="cuda",
+        training_ray_remote_args={"num_gpus": 1, "num_cpus": 8},
+    )
+
+    assert captured["task_options"] == {"num_gpus": 1, "num_cpus": 8}
+    assert captured["task_args"][0] == (fake_dataset,)
+    assert captured["train_ivf"]["accelerator"] == "cuda"
+    assert "accelerator" not in captured["fragment_handler_kwargs"]
+    assert fake_dataset.commit_kwargs["segments"] == ["segment", "segment"]

@@ -1819,3 +1819,32 @@ def test_build_distributed_vector_index_with_precomputed_centroids(tmp_path):
     q = [random.gauss(0, 1) for _ in range(64)]
     result = updated_dataset.to_table(nearest={"column": "vector", "q": q, "k": 5})
     assert result.num_rows == 5
+
+
+def test_build_distributed_vector_index_trains_on_ray_task(tmp_path):
+    """Phase 1 runs as a Ray task; the dataset travels pickled with its version."""
+    dataset_uri = generate_multi_fragment_vector_dataset(
+        tmp_path, num_fragments=4, rows_per_fragment=512, dim=64
+    )
+
+    try:
+        updated_dataset = lr.create_index(
+            uri=dataset_uri,
+            column="vector",
+            index_type="IVF_PQ",
+            name="idx_remote_training",
+            num_workers=2,
+            num_partitions=4,
+            num_sub_vectors=8,
+            sample_rate=8,
+            training_ray_remote_args={"num_cpus": 1},
+        )
+    except RuntimeError as exc:
+        _skip_if_vector_segments_unsupported(exc)
+
+    indices = {idx.name: idx for idx in updated_dataset.describe_indices()}
+    assert indices["idx_remote_training"].index_type == "IVF_PQ"
+
+    q = [random.gauss(0, 1) for _ in range(64)]
+    result = updated_dataset.to_table(nearest={"column": "vector", "q": q, "k": 5})
+    assert result.num_rows == 5
