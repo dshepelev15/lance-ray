@@ -10,6 +10,7 @@ import pickle
 import shutil
 import time
 import uuid
+from collections import deque
 from collections.abc import Callable, Iterable
 from typing import Any, Literal, Optional, TypeAlias, Union
 
@@ -19,7 +20,7 @@ import ray
 from lance.dataset import Index, IndexConfig, LanceDataset
 from lance.indices import IndicesBuilder
 from packaging import version
-from ray.util.multiprocessing import Pool
+from ray.exceptions import ActorUnavailableError
 
 from .field_path import resolve_arrow_field_path, resolve_dataset_field_path
 from .utils import (
@@ -138,6 +139,13 @@ def _distribute_fragments_balanced(
     return non_empty_batches
 
 
+class _BatchWorker:
+    """Ray actor that runs one fragment-batch handler call at a time."""
+
+    def run(self, handler: Callable[[Any], dict[str, Any]], payload: Any) -> Any:
+        return handler(payload)
+
+
 def _map_async_with_pool(
     create_fragment_handler: Callable[[], Any],
     fragment_batches: list[Any],
@@ -148,76 +156,91 @@ def _map_async_with_pool(
     max_task_retries: int = 0,
     on_success: Optional[Callable[[Any, dict[str, Any]], None]] = None,
 ) -> list[dict[str, Any]]:
-    """Run fragment tasks in a Ray-backed multiprocessing Pool.
+    """Run fragment tasks on a pool of Ray actors, one batch per idle worker.
 
-    This helper encapsulates the common Pool submission + error wrapping logic
-    so that both scalar and vector distributed index builders can share the
-    same implementation.
+    Each batch is handed to whichever worker is idle at that moment, so a slow
+    node only delays the batches it is actually running. (Ray's
+    ``multiprocessing.Pool`` assigns batches round-robin at submission time,
+    which makes a map of N batches wait for the slowest worker's fixed share
+    of N.) Batches whose handler returned ``{"status": "error"}`` or whose
+    Ray task/actor failed are resubmitted immediately, up to
+    ``max_task_retries`` times each, rather than after every other batch has
+    finished; handlers must therefore be idempotent.
 
-    When ``max_task_retries`` is positive, task payloads whose handler returned
-    a ``{"status": "error"}`` result — or whose task failed at the Ray level
-    (Ray's Pool yields the exception *object* as the imap value when a task or
-    its actor dies) — are resubmitted (handlers must therefore be idempotent).
-    Note that Ray Pool actors are not restarted after an actor death by
-    default; pass ``{"max_restarts": ...}`` in ``ray_remote_args`` to make
-    retries survive worker-process crashes. ``on_success`` is invoked with
-    ``(payload, result)`` as soon as a task result with
-    ``status == "success"`` is observed, which allows callers to checkpoint
-    completed work before the whole map finishes.
+    Workers are actors created with ``ray_remote_args`` (``num_cpus=0`` unless
+    given, like Ray's Pool). A worker whose process dies is dropped from the
+    pool unless ``{"max_restarts": ...}`` is set, in which case Ray restarts
+    it and it keeps receiving batches. ``on_success`` is invoked with
+    ``(payload, result)`` as soon as a batch succeeds, which allows callers to
+    checkpoint completed work before the whole map finishes.
     """
-    pool = Pool(processes=num_workers, ray_remote_args=ray_remote_args)
+    remote_args = {"num_cpus": 0, **(ray_remote_args or {})}
+    worker_cls: Any = ray.remote(**remote_args)(_BatchWorker)
+    workers: list[Any] = [worker_cls.remote() for _ in range(num_workers)]
     try:
         fragment_handler = create_fragment_handler()
-
-        if max_task_retries == 0 and on_success is None:
-            rst_futures = pool.map_async(
-                fragment_handler,
-                fragment_batches,
-                chunksize=1,
-            )
-            return rst_futures.get()
-
         results: dict[int, dict[str, Any]] = {}
-        pending = list(enumerate(fragment_batches))
-        for attempt in range(max_task_retries + 1):
-            round_payloads = [payload for _, payload in pending]
-            still_failing: list[tuple[int, Any]] = []
-            for (payload_index, payload), result in zip(
-                pending,
-                pool.imap(fragment_handler, round_payloads, chunksize=1),
-                strict=True,
-            ):
-                if isinstance(result, Exception):
-                    # Ray's Pool delivers task/actor failures as exception
-                    # objects in the imap stream (PoolTaskError wraps the
-                    # original exception in .underlying).
-                    underlying = getattr(result, "underlying", result)
-                    result = {
-                        "status": "error",
-                        "error": f"{type(underlying).__name__}: {underlying}",
-                    }
-                results[payload_index] = result
-                if result.get("status") == "success":
-                    if on_success is not None:
-                        on_success(payload, result)
-                else:
-                    still_failing.append((payload_index, payload))
-            pending = still_failing
-            if not pending:
-                break
-            if attempt < max_task_retries:
+        pending: deque[tuple[int, int]] = deque(
+            (index, 0) for index in range(len(fragment_batches))
+        )
+        idle: list[Any] = []
+        # A worker joins the idle list once Ray has actually started it, so a
+        # batch never queues on an actor still waiting for cluster resources.
+        starting: dict[Any, Any] = {w.__ray_ready__.remote(): w for w in workers}
+        in_flight: dict[Any, tuple[Any, int, int]] = {}
+        while pending or in_flight:
+            while pending and idle:
+                index, attempt = pending.popleft()
+                worker = idle.pop()
+                ref = worker.run.remote(fragment_handler, fragment_batches[index])
+                in_flight[ref] = (worker, index, attempt)
+            if not in_flight and not starting:
+                raise RuntimeError("every worker has died")
+            [ref], _ = ray.wait(list(in_flight) + list(starting), num_returns=1)
+            if ref in starting:
+                worker = starting.pop(ref)
+                try:
+                    ray.get(ref)
+                    idle.append(worker)
+                except ActorUnavailableError:
+                    # Restarting under max_restarts: probe again shortly.
+                    time.sleep(0.5)
+                    starting[worker.__ray_ready__.remote()] = worker
+                except Exception as exc:
+                    logger.warning(
+                        "Worker unavailable (%s); dropping it. Pass max_restarts "
+                        "in ray_remote_args to restart dead workers",
+                        exc,
+                    )
+                continue
+            worker, index, attempt = in_flight.pop(ref)
+            try:
+                result = ray.get(ref)
+                idle.append(worker)
+            except Exception as exc:
+                result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+                # A live worker is ready again at once; a dead one is dropped
+                # (or, with max_restarts, restarted) by the start path above.
+                starting[worker.__ray_ready__.remote()] = worker
+            results[index] = result
+            if result.get("status") == "success":
+                if on_success is not None:
+                    on_success(fragment_batches[index], result)
+            elif attempt < max_task_retries:
                 logger.warning(
-                    "%d task(s) failed; retrying (attempt %d of %d)",
-                    len(pending),
-                    attempt + 2,
+                    "Batch %d failed (attempt %d of %d): %s; resubmitting",
+                    index,
+                    attempt + 1,
                     max_task_retries + 1,
+                    result.get("error"),
                 )
+                pending.append((index, attempt + 1))
         return [results[i] for i in range(len(fragment_batches))]
-    except Exception as exc:  # pragma: no cover - exercised via integration tests
+    except Exception as exc:
         raise RuntimeError(f"{error_prefix}: {exc}") from exc
     finally:
-        pool.close()
-        pool.join()
+        for worker in workers:
+            ray.kill(worker)
 
 
 def _is_ray_object_ref(value: Any) -> bool:
