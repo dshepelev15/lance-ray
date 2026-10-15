@@ -1764,6 +1764,121 @@ def _commit_index_segments_with_retry(
     raise last_exc
 
 
+def _train_vector_index_models(
+    dataset: LanceDataset,
+    *,
+    column: str,
+    index_type_name: str,
+    metric: str,
+    num_partitions: Optional[int],
+    num_sub_vectors: Optional[int],
+    ivf_centroids: Any,
+    pq_codebook: Any,
+    ivf_sample_rate: int,
+    pq_sample_rate: int,
+    max_iters: int,
+    accelerator: Any,
+    build_kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Phase 1: resolve the IVF/PQ/RaBitQ artifacts shared by every segment.
+
+    Precomputed artifacts pass through untouched; the rest are trained on
+    ``dataset``. ``build_kwargs`` are the extra :func:`create_index` keywords
+    (``rabitq_model``, ``num_bits``). Runs on the driver, or as a Ray task
+    when :func:`create_index` is given ``training_ray_remote_args``: a
+    ``LanceDataset`` pickles with its version and manifest, so the task sees
+    exactly the data the build was planned on.
+    """
+    rabitq_model = build_kwargs.get("rabitq_model")
+    num_bits = build_kwargs.get("num_bits", 1)
+    field = resolve_arrow_field_path(dataset.schema, column).field
+    builder = _indices_builder_for_field_path(dataset, column, field)
+    dimension = builder.dimension
+
+    if ivf_centroids is not None:
+        num_partitions = _num_partitions_from_centroids(ivf_centroids)
+        logger.info(
+            "Phase 1: Using precomputed IVF centroids "
+            "(num_partitions=%d); skipping IVF training",
+            num_partitions,
+        )
+    else:
+        logger.info(
+            "Phase 1: Training IVF centroids (index_type=%s, metric=%s, "
+            "requested_num_partitions=%s, num_rows=%d, dimension=%d, "
+            "sample_rate=%d, max_iters=%d, accelerator=%s)",
+            index_type_name,
+            metric,
+            num_partitions,
+            dataset.count_rows(),
+            dimension,
+            ivf_sample_rate,
+            max_iters,
+            accelerator,
+        )
+        train_ivf_kwargs: dict[str, Any] = {
+            "num_partitions": num_partitions,
+            "distance_type": metric,
+            "sample_rate": ivf_sample_rate,
+            "max_iters": max_iters,
+        }
+        if accelerator is not None:
+            train_ivf_kwargs["accelerator"] = accelerator
+        ivf_model = builder.train_ivf(**train_ivf_kwargs)
+        ivf_centroids = ivf_model.centroids
+        num_partitions = ivf_model.num_partitions
+        logger.info("IVF training completed: num_partitions=%d", num_partitions)
+
+    if index_type_name in {"IVF_PQ", "IVF_HNSW_PQ"}:
+        if pq_codebook is not None:
+            if num_sub_vectors is None:
+                raise ValueError(
+                    "num_sub_vectors must be provided together with a "
+                    "precomputed pq_codebook"
+                )
+            num_sub_vectors = _normalize_pq_params(num_sub_vectors, dimension)
+            logger.info(
+                "Phase 1: Using precomputed PQ codebook "
+                "(num_sub_vectors=%d); skipping PQ training",
+                num_sub_vectors,
+            )
+        else:
+            from lance.indices.ivf import IvfModel
+
+            ivf_model = IvfModel(ivf_centroids, metric)
+            logger.info(
+                "Training PQ codebook: requested_num_sub_vectors=%s, sample_rate=%d",
+                num_sub_vectors,
+                pq_sample_rate,
+            )
+            pq_model = _train_pq_for_field_path(
+                builder,
+                ivf_model,
+                num_subvectors=num_sub_vectors,
+                sample_rate=pq_sample_rate,
+                max_iters=max_iters,
+            )
+            pq_codebook = pq_model.codebook
+            num_sub_vectors = pq_model.num_subvectors
+            logger.info("PQ training completed: num_sub_vectors=%d", num_sub_vectors)
+
+    if index_type_name == "IVF_RQ" and rabitq_model is None:
+        logger.info(
+            "Building shared RaBitQ model: dimension=%d, num_bits=%s",
+            dimension,
+            num_bits,
+        )
+        rabitq_model = _build_rabitq_model(dimension=dimension, num_bits=num_bits)
+
+    return {
+        "ivf_centroids": ivf_centroids,
+        "pq_codebook": pq_codebook,
+        "num_partitions": num_partitions,
+        "num_sub_vectors": num_sub_vectors,
+        "rabitq_model": rabitq_model,
+    }
+
+
 def create_index(
     uri: Optional[Union[str, "lance.LanceDataset"]] = None,
     column: str = "",
@@ -1786,6 +1901,7 @@ def create_index(
     pq_sample_rate: Optional[int] = None,
     max_iters: int = 50,
     accelerator: Optional[Any] = None,
+    training_ray_remote_args: Optional[dict[str, Any]] = None,
     ivf_centroids: Optional[
         pa.Array | pa.FixedSizeListArray | pa.FixedShapeTensorArray
     ] = None,
@@ -1829,10 +1945,17 @@ def create_index(
             (optional)
         max_iters: Maximum k-means iterations for IVF and PQ training
             (default: 50)
-        accelerator: Accelerator for driver-side IVF centroid training, e.g.
+        accelerator: Accelerator for Phase 1 IVF centroid training, e.g.
             ``"cuda"`` or ``"mps"`` (optional). Applies to Phase 1 training
             only; it is intentionally not forwarded to fragment workers
             because torch inputs disable Lance's distributed build path.
+        training_ray_remote_args: When set, Phase 1 (IVF/PQ training and the
+            RaBitQ model) runs as a Ray task with these options instead of on
+            the driver, e.g. ``{"num_cpus": 16, "memory": 64 * 2**30}`` to
+            keep a resource-poor head node out of k-means, or
+            ``{"num_gpus": 1}`` together with ``accelerator="cuda"`` to train
+            on a GPU node. The task receives the dataset pinned to the
+            version the build was planned on (optional)
         ivf_centroids: Pre-computed IVF centroids. When provided, driver-side
             IVF training is skipped and ``num_partitions`` is derived from the
             centroids. Accepts a FixedSizeListArray, a 1-D
@@ -1985,10 +2108,6 @@ def create_index(
     if rabitq_model is not None:
         index_build_kwargs["rabitq_model"] = rabitq_model
 
-    pq_index_types = {"IVF_PQ", "IVF_HNSW_PQ"}
-    needs_pq = index_type_name in pq_index_types
-    needs_rq = index_type_name == "IVF_RQ"
-
     effective_ivf_sample_rate = (
         ivf_sample_rate if ivf_sample_rate is not None else sample_rate
     )
@@ -1997,7 +2116,6 @@ def create_index(
     )
 
     builder = _indices_builder_for_field_path(dataset_obj, column, field)
-    num_rows = dataset_obj.count_rows()
     dimension = builder.dimension
     dataset_version = getattr(dataset_obj, "version", None)
 
@@ -2027,139 +2145,50 @@ def create_index(
         )
         checkpoint = _VectorIndexBuildCheckpoint(checkpoint_dir, fingerprint)
 
-    # Global training artifacts are resolved once on the driver so that all
-    # shards share the same centroids/codebook/rotation; the Ray entrypoint
-    # owns the lifecycle of these artifacts and distributes them to workers.
-    ivf_centroids_artifact = ivf_centroids
-    pq_codebook_artifact = pq_codebook
-    ivf_model: Any = None
-
+    # Global training artifacts are resolved once so that all shards share
+    # the same centroids/codebook/rotation; the Ray entrypoint owns the
+    # lifecycle of these artifacts and distributes them to workers.
     phase1_state = checkpoint.load_phase1() if checkpoint is not None else None
     if phase1_state is not None:
         logger.info(
             "Phase 1: Reusing IVF/PQ training artifacts from checkpoint at %s",
             checkpoint_dir,
         )
-        ivf_centroids_artifact = phase1_state["ivf_centroids"]
-        pq_codebook_artifact = phase1_state["pq_codebook"]
-        num_partitions = phase1_state["num_partitions"]
-        num_sub_vectors = phase1_state["num_sub_vectors"]
-        if (
-            phase1_state.get("rabitq_model") is not None
-            and index_build_kwargs.get("rabitq_model") is None
-        ):
-            index_build_kwargs["rabitq_model"] = phase1_state["rabitq_model"]
     else:
-        if ivf_centroids_artifact is not None:
-            num_partitions = _num_partitions_from_centroids(ivf_centroids_artifact)
-            logger.info(
-                "Phase 1: Using precomputed IVF centroids "
-                "(num_partitions=%d); skipping IVF training",
-                num_partitions,
-            )
+        training_kwargs: dict[str, Any] = {
+            "column": column,
+            "index_type_name": index_type_name,
+            "metric": metric_lower,
+            "num_partitions": num_partitions,
+            "num_sub_vectors": num_sub_vectors,
+            "ivf_centroids": ivf_centroids,
+            "pq_codebook": pq_codebook,
+            "ivf_sample_rate": effective_ivf_sample_rate,
+            "pq_sample_rate": effective_pq_sample_rate,
+            "max_iters": max_iters,
+            "accelerator": accelerator,
+            "build_kwargs": index_build_kwargs,
+        }
+        if training_ray_remote_args is None:
+            phase1_state = _train_vector_index_models(dataset_obj, **training_kwargs)
         else:
-            requested_num_partitions = num_partitions
             logger.info(
-                "Phase 1: Training IVF centroids (index_type=%s, metric=%s, "
-                "requested_num_partitions=%s, num_rows=%d, dimension=%d, "
-                "sample_rate=%d, max_iters=%d, accelerator=%s)",
-                index_type_name,
-                metric_lower,
-                requested_num_partitions,
-                num_rows,
-                dimension,
-                effective_ivf_sample_rate,
-                max_iters,
-                accelerator,
+                "Phase 1: Training on a Ray worker with options %s",
+                training_ray_remote_args,
             )
-            train_ivf_kwargs: dict[str, Any] = {
-                "num_partitions": requested_num_partitions,
-                "distance_type": metric_lower,
-                "sample_rate": effective_ivf_sample_rate,
-                "max_iters": max_iters,
-            }
-            if accelerator is not None:
-                train_ivf_kwargs["accelerator"] = accelerator
-            ivf_model = builder.train_ivf(**train_ivf_kwargs)
-            ivf_centroids_artifact = ivf_model.centroids
-            num_partitions = ivf_model.num_partitions
-            logger.info(
-                "IVF training completed: num_partitions=%d",
-                num_partitions,
+            train_task = ray.remote(_train_vector_index_models).options(
+                **training_ray_remote_args
             )
-
-        if needs_pq:
-            if pq_codebook_artifact is not None:
-                if num_sub_vectors is None:
-                    raise ValueError(
-                        "num_sub_vectors must be provided together with a "
-                        "precomputed pq_codebook"
-                    )
-                num_sub_vectors = _normalize_pq_params(num_sub_vectors, dimension)
-                logger.info(
-                    "Phase 1: Using precomputed PQ codebook "
-                    "(num_sub_vectors=%d); skipping PQ training",
-                    num_sub_vectors,
-                )
-            else:
-                if ivf_model is None:
-                    from lance.indices.ivf import IvfModel
-
-                    ivf_model = IvfModel(ivf_centroids_artifact, metric_lower)
-                requested_num_sub_vectors = num_sub_vectors
-                logger.info(
-                    "Training PQ codebook: requested_num_sub_vectors=%s, "
-                    "sample_rate=%d",
-                    requested_num_sub_vectors,
-                    effective_pq_sample_rate,
-                )
-                pq_model = _train_pq_for_field_path(
-                    builder,
-                    ivf_model,
-                    num_subvectors=requested_num_sub_vectors,
-                    sample_rate=effective_pq_sample_rate,
-                    max_iters=max_iters,
-                )
-                pq_codebook_artifact = pq_model.codebook
-                num_sub_vectors = pq_model.num_subvectors
-                logger.info(
-                    "PQ training completed: num_sub_vectors=%d", num_sub_vectors
-                )
-
-        if needs_rq and index_build_kwargs.get("rabitq_model") is None:
-            num_bits = index_build_kwargs.get("num_bits", 1)
-            logger.info(
-                "Building shared RaBitQ model: dimension=%d, num_bits=%s",
-                dimension,
-                num_bits,
-            )
-            index_build_kwargs["rabitq_model"] = _build_rabitq_model(
-                dimension=dimension,
-                num_bits=num_bits,
-            )
-
+            phase1_state = ray.get(train_task.remote(dataset_obj, **training_kwargs))
         if checkpoint is not None:
-            checkpoint.save_phase1(
-                {
-                    "ivf_centroids": ivf_centroids_artifact,
-                    "pq_codebook": pq_codebook_artifact,
-                    "num_partitions": num_partitions,
-                    "num_sub_vectors": num_sub_vectors,
-                    "rabitq_model": index_build_kwargs.get("rabitq_model"),
-                }
-            )
+            checkpoint.save_phase1(phase1_state)
 
-    if ivf_centroids_artifact is None:
-        raise ValueError(
-            "ivf_centroids must be provided or trainable for IVF-based "
-            "distributed vector indices"
-        )
-
-    if needs_pq and pq_codebook_artifact is None:
-        raise ValueError(
-            "pq_codebook must be provided or trainable for PQ-based "
-            "distributed vector indices"
-        )
+    ivf_centroids_artifact = phase1_state["ivf_centroids"]
+    pq_codebook_artifact = phase1_state["pq_codebook"]
+    num_partitions = phase1_state["num_partitions"]
+    num_sub_vectors = phase1_state["num_sub_vectors"]
+    if phase1_state["rabitq_model"] is not None:
+        index_build_kwargs["rabitq_model"] = phase1_state["rabitq_model"]
 
     fragment_batches, fragment_sizes = _plan_fragment_batches(
         fragments,

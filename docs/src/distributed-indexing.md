@@ -112,6 +112,7 @@ def create_index(
     pq_sample_rate: Optional[int] = None,
     max_iters: int = 50,
     accelerator: Optional[Any] = None,
+    training_ray_remote_args: Optional[dict[str, Any]] = None,
     ivf_centroids: Optional["pyarrow.Array"] = None,
     pq_codebook: Optional["pyarrow.Array"] = None,
     rabitq_model: Optional[str] = None,
@@ -146,7 +147,8 @@ def create_index(
 | `ivf_sample_rate` | `int`, optional | Overrides `sample_rate` for IVF centroid training. The IVF training sample is `ivf_sample_rate * num_partitions` rows, so lowering it bounds driver memory on large partition counts |
 | `pq_sample_rate` | `int`, optional | Overrides `sample_rate` for PQ codebook training |
 | `max_iters` | `int`, optional | Maximum k-means iterations for IVF and PQ training, default is 50 |
-| `accelerator` | `str` or `torch.Device`, optional | Accelerator for driver-side IVF training, e.g. `"cuda"` or `"mps"`. Applies to Phase 1 training only; it is not forwarded to fragment workers because torch inputs disable Lance's distributed build path |
+| `accelerator` | `str` or `torch.Device`, optional | Accelerator for Phase 1 IVF training, e.g. `"cuda"` or `"mps"`. Applies to Phase 1 training only; it is not forwarded to fragment workers because torch inputs disable Lance's distributed build path |
+| `training_ray_remote_args` | `Dict[str, Any]`, optional | When set, Phase 1 (IVF/PQ training and the RaBitQ model) runs as a Ray task with these options instead of on the driver, e.g. `{"num_cpus": 16, "memory": 64 * 2**30}` to keep a small head node out of k-means, or `{"num_gpus": 1}` with `accelerator="cuda"` to train on a GPU node. The dataset is handed to the task pinned to the version the build was planned on; the result is checkpointed like driver-side training |
 | `ivf_centroids` | `pyarrow.Array`, optional | Pre-computed IVF centroids. When provided, driver-side IVF training is skipped and `num_partitions` is derived from the centroids |
 | `pq_codebook` | `pyarrow.Array`, optional | Pre-computed PQ codebook for PQ-based indices. When provided together with `num_sub_vectors`, driver-side PQ training is skipped. Must be trained against the same centroids and metric |
 | `rabitq_model` | `str`, optional | Pre-built RaBitQ model for IVF_RQ. If omitted for IVF_RQ, Lance-Ray builds one shared model on the driver |
